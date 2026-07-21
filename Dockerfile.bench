@@ -1,0 +1,26 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUNS=5
+ENV BENCH_TIMEOUT=30
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git \
+        lua5.4 \
+        luajit \
+        python3 \
+    && ln -sf /usr/bin/lua5.4      /usr/local/bin/lua \
+    && ln -sf /usr/bin/luac5.4     /usr/local/bin/luac \
+    && ln -sf /usr/bin/luajit      /usr/local/bin/luajit \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /magnesium
+COPY . .
+
+RUN make CC=gcc all lib
+
+# Smoke check before benchmarking
+RUN ./magnesium --version && lua -v && luajit -v && python3 --version
+
+CMD ["/bin/bash", "/magnesium/scripts/run_bench.sh"]

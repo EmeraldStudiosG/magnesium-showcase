@@ -1,0 +1,2 @@
+Struct 'Point' has no field 'y'.
+[line 6] in tests/test_error_field_set.mg()

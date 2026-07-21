@@ -1,0 +1,19 @@
+[book]
+title = "The Magnesium Book"
+authors = ["EmeraldStudiosG"]
+description = "The book for Magnesium, a fast embeddable scripting language."
+language = "en"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+git-repository-url = "https://github.com/EmeraldStudiosG/magnesium-dev"
+additional-css = ["src/magnesium.css"]
+additional-js = ["src/flow.js"]
+
+[output.html.playground]
+runnable = true

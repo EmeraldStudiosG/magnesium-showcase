@@ -1,0 +1,10 @@
+start
+inside if
+leaving if block
+after if
+in function
+defer 1
+defer 2
+defer 3
+done
+script exit

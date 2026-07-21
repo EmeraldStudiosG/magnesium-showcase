@@ -1,0 +1,78 @@
+{
+    "name": "magnesium-vscode",
+    "displayName": "Magnesium Language Server",
+    "description": "Language server with syntax highlighting, diagnostics, completion, hover, and more for the Magnesium programming language.",
+    "version": "3.6.2",
+    "publisher": "temporary",
+    "license": "MIT",
+    "engines": {
+        "vscode": "^1.97.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "activationEvents": [
+        "onLanguage:magnesium"
+    ],
+    "main": "./out/extension.js",
+    "scripts": {
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "vscode:prepublish": "npm run compile"
+    },
+    "contributes": {
+        "languages": [
+            {
+                "id": "magnesium",
+                "aliases": [
+                    "Magnesium",
+                    "mg"
+                ],
+                "extensions": [
+                    ".mg"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "magnesium",
+                "scopeName": "source.mg",
+                "path": "./syntaxes/magnesium.tmLanguage.json"
+            }
+        ],
+        "themes": [
+            {
+                "label": "Magnesium Dark",
+                "uiTheme": "vs-dark",
+                "path": "./themes/magnesium-dark-color-theme.json"
+            }
+        ],
+        "configuration": [
+            {
+                "title": "Magnesium",
+                "properties": {
+                    "magnesium.executablePath": {
+                        "type": "string",
+                        "default": "magnesium",
+                        "description": "Path to the magnesium executable"
+                    }
+                }
+            }
+        ],
+        "commands": [
+            {
+                "command": "magnesium.restartServer",
+                "title": "Magnesium: Restart Language Server"
+            }
+        ]
+    },
+    "devDependencies": {
+        "@types/node": "^25.6.0",
+        "@types/vscode": "^1.97.0",
+        "typescript": "^6.0.2"
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    }
+}

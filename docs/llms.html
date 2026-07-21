@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Magnesium - LLM Reference</title>
+</head>
+<body>
+
+<h1>Magnesium Language Reference for LLMs</h1>
+
+<p>Magnesium is an embeddable, data-oriented scripting language with a register-based VM. Lua is a reference point for embedding expectations, not a syntax target. Files use the <code>.mg</code> extension. Compiled bytecode uses <code>.mgc</code>.</p>
+
+<p><strong>Version:</strong> 1.0.0</p>
+
+<h2>Design Principles</h2>
+<table>
+<tr><th>Principle</th><th>Decision</th><th>Why</th></tr>
+<tr><td>Local by default</td><td><code>let x = 1</code> creates a local. Globals are explicit with <code>@</code>.</td><td>Implicit globals are convenient at first and painful later. The <code>@</code> prefix makes shared state visible in code review and in a game engine embedding context.</td></tr>
+<tr><td>Small syntax</td><td>Prefer a few clear forms over many special cases.</td><td>Magnesium stays small, embeddable, script-friendly, and fast without requiring a JIT.</td></tr>
+<tr><td>Runtime clarity</td><td>Errors are values, not hidden exceptions.</td><td>Failure is visible in the function signature and return path.</td></tr>
+<tr><td>Embeddable runtime</td><td>The VM should be easy for a host engine to create, destroy, and configure.</td><td>Magnesium was built for a game engine and became its own project. It remains engine-friendly by design.</td></tr>
+<tr><td>Fast interpreter</td><td>Syntax should compile to straightforward bytecode.</td><td>A JIT is not required for good performance. Register-based dispatch, NaN-boxing, inline caches, and fused opcodes carry the load.</td></tr>
+</table>
+
+<h2>Types</h2>
+
+<table>
+<tr><th>Type</th><th>Literal Syntax</th><th>Notes</th></tr>
+<tr><td>Number</td><td><code>42</code>, <code>3.14</code></td><td>Single type; VM optimizes int-shaped values internally</td></tr>
+<tr><td>String</td><td><code>"hello"</code></td><td>Immutable. Concatenate with <code>+</code>. Interpolate with <code>_"...{expr}..."</code></td></tr>
+<tr><td>Boolean</td><td><code>true</code>, <code>false</code></td><td><code>false</code> and <code>null</code> are falsey; everything else is truthy</td></tr>
+<tr><td>Null</td><td><code>null</code></td><td>Missing value</td></tr>
+<tr><td>Array</td><td><code>[1, 2, 3]</code></td><td>Zero-indexed, mutable</td></tr>
+<tr><td>Dict</td><td><code>&amp;&lt; key = val &gt;</code></td><td>String keys only. Lookup: <code>d&lt;"key"&gt;</code></td></tr>
+<tr><td>Struct</td><td><code>Point { x = 1, y = 2 }</code></td><td>Fixed-shape named fields. Faster than dicts</td></tr>
+<tr><td>Function</td><td><code>fn(x) return x end</code></td><td>First-class. Supports multi-return</td></tr>
+<tr><td>Error</td><td><code>Err("Kind", "msg")</code></td><td>Has <code>.kind</code>, <code>.message</code>, <code>.hint</code>, <code>.file</code>, <code>.line</code>, <code>.function</code>, <code>.report</code></td></tr>
+</table>
+<p>There is no public Lua-style table type and no public <code>table.*</code> namespace. Use arrays, dicts, and structs directly.</p>
+
+<h2>Variables</h2>
+<pre><code>let x = 10            // local
+const max = 100       // non-reassignable local
+let @debug = true     // global (explicit @)
+let a, b = func()     // multi-return binding
+x = 20                // reassign local
+@debug = false        // reassign global
+</code></pre>
+
+<h2>Optional Static Types</h2>
+<pre><code>!strict
+
+type PlayerData = &amp;&lt; name: string, score: number &gt;
+
+extern fn host_score(player: string): number
+extern const MAX_SCORE: number
+
+let player: PlayerData = &amp;&lt; name = "Ada", score = host_score("Ada") &gt;
+let scores: [number] = [10, 20, 30]
+let tags: &amp;&lt;string, bool&gt; = &amp;&lt; boss = true &gt;
+</code></pre>
+
+<table>
+<tr><th>Mode</th><th>Meaning</th></tr>
+<tr><td>No directive</td><td>Dynamic mode. Type annotations parse but are ignored unless the host or LSP explicitly requests checking.</td></tr>
+<tr><td><code>!strict</code></td><td>Run the static checker and report type diagnostics.</td></tr>
+<tr><td><code>!nocheck</code></td><td>Suppress type diagnostics for the file, even if checking is globally requested.</td></tr>
+</table>
+
+<p>Type annotations are optional and do not change runtime semantics or emitted bytecode. <code>any</code> is the explicit escape hatch. <code>unknown</code> accepts any input but cannot be used as a concrete type without narrowing/checking.</p>
+
+<h2>Operators</h2>
+
+<pre><code>// Arithmetic
++  -  *  /  %
+
+// Compound assignment
++=  -=  *=  /=  %=
+
+// Comparison
+==  !=  &lt;  &gt;  &lt;=  &gt;=
+
+// Logical (word-based)
+and  or  not
+
+// Range
+..    // exclusive: 1..5 → 1,2,3,4
+..=   // inclusive: 1..=5 → 1,2,3,4,5
+
+// Fallible propagation
+?
+</code></pre>
+
+<h2>Control Flow</h2>
+
+<h3>Conditionals</h3>
+<pre><code>if score &gt;= 90 then
+    print("A")
+elseif score &gt;= 80 then
+    print("B")
+else
+    print("try again")
+end
+</code></pre>
+
+<h3>Loops</h3>
+<pre><code>// Infinite loop
+loop
+    if done then break end
+end
+
+// Range loop (exclusive)
+for i in 1..5
+    print(i)       // 1, 2, 3, 4
+end
+
+// Range loop (inclusive)
+for i in 1..=5
+    print(i)       // 1, 2, 3, 4, 5
+end
+
+// Collection loop (array)
+for item in items
+    print(item)
+end
+
+// Collection loop (dict)
+for key, value in settings
+    print(key + " = " + tostring(value))
+end
+</code></pre>
+
+<p><code>break</code> and <code>continue</code> work inside loops.</p>
+
+<h2>Functions</h2>
+
+<pre><code>// Named function
+fn add(a, b)
+    return a + b
+end
+
+// Anonymous function
+let double = fn(x) return x * 2 end
+
+// Multi-return
+fn bounds()
+    return 0, 100
+end
+let min, max = bounds()
+
+// Value, err pattern: success returns fewer values than the caller binds;
+// missing slots fill with null automatically.
+fn divide(a, b)
+    if b == 0 then return null, Err("MathError", "Divide by zero") end
+    return a / b
+end
+let value, err = divide(10, 0)
+</code></pre>
+
+<h3>Methods</h3>
+<pre><code>struct Player
+    name
+    hp
+end
+
+fn Player.damage(self, amount)
+    self.hp = self.hp - amount
+end
+
+let p = Player { name = "Ada", hp = 100 }
+p.damage(25)
+print(p.hp)   // 75
+</code></pre>
+
+<p>Methods use <code>fn TypeName.method(self, ...)</code> syntax. <code>self</code> is received automatically on dot-call.</p>
+
+<h3>Defer</h3>
+<pre><code>fn work()
+    defer print("done")
+    print("working")
+end
+// prints "working" then "done"
+</code></pre>
+
+<h2>Error Handling</h2>
+
+<p>Recoverable errors use Lua-style <code>value, err</code> multi-return. There are no exceptions for normal control flow.</p>
+
+<h3>Error Objects</h3>
+<pre><code>let err = Err("ConfigError", "Missing port", "Set config.port before starting.")
+print(err.kind)     // ConfigError
+print(err.message)  // Missing port
+print(err.hint)     // Set config.port before starting.
+print(err.report)   // formatted diagnostic string
+</code></pre>
+
+<h3>The <code>?</code> Operator</h3>
+<p>Postfix <code>?</code> on a fallible lookup or call. On success: unwraps the value. On failure: returns <code>null, err</code> from the current function immediately.</p>
+
+<pre><code>// Fallible dict lookup
+fn get_score(scores, name)
+    return scores&lt;name&gt;?
+end
+
+// Fallible stdlib call
+fn load_port(config)
+    let port = dict.require(config, "port")?
+    return port
+end
+</code></pre>
+
+<p>Supported forms: <code>dict&lt;key&gt;?</code>, <code>arr[index]?</code>, <code>str[index]?</code>, <code>fallible_call()?</code>. Only propagates actual <code>Err</code> objects.</p>
+
+<h3>try / catch</h3>
+<pre><code>// Capture propagated error
+let value, err = try
+    dict.require(config, "port")?
+end
+
+// Handle locally
+try
+    let port = dict.require(config, "port")?
+    print(port)
+catch err
+    print(err.report)
+end
+</code></pre>
+
+<h3>Plain vs Fallible Lookup</h3>
+<table>
+<tr><th>Expression</th><th>Plain result on failure</th><th><code>?</code> result on failure</th></tr>
+<tr><td><code>dict&lt;key&gt;</code></td><td><code>null</code></td><td>returns <code>null, Err("KeyError", ...)</code></td></tr>
+<tr><td><code>arr[index]</code></td><td><code>null</code></td><td>returns <code>null, Err("IndexError", ...)</code></td></tr>
+<tr><td><code>str[index]</code></td><td><code>null</code></td><td>returns <code>null, Err("IndexError", ...)</code></td></tr>
+</table>
+
+<h2>Collections</h2>
+
+<h3>Arrays</h3>
+<pre><code>let arr = [1, 2, 3]
+arr[0]          // 1 (0-based indexing)
+arr[0]?        // fallible - returns err on out of range
+push(arr, 4)   // append
+len(arr)       // 4
+</code></pre>
+
+<h3>Dicts</h3>
+<pre><code>let d = &amp;&lt; name = "Ada", hp = 100 &gt;
+d&lt;"name"&gt;           // "Ada"
+d&lt;"name"&gt;?          // fallible lookup
+d&lt;"hp"&gt; = 90        // set
+</code></pre>
+
+<p>Dict keys are always strings. The <code>&amp;&lt; &gt;</code> syntax avoids ambiguity with <code>&lt;</code> and <code>&gt;</code> comparison operators.</p>
+
+<h3>Structs</h3>
+<pre><code>struct Point
+    x
+    y
+end
+
+let p = Point { x = 1, y = 2 }
+p.x        // 1
+</code></pre>
+
+<h3>Enums</h3>
+<pre><code>enum Status { Ok, Error, Pending }
+let s = Status&lt;"Ok"&gt;
+</code></pre>
+
+<h2>Modules</h2>
+<pre><code>// Export (math_utils.mg)
+export fn square(x)
+    return x * x
+end
+
+// Import (main.mg)
+import "math_utils"
+import "systems/combat" as combat    // with alias
+
+print(math_utils.square(5))
+</code></pre>
+
+<p>Imported modules are cached. Repeated imports share the same exports. Import paths omit the <code>.mg</code> suffix.</p>
+
+<h2>Standard Library</h2>
+
+<h3>Global Functions</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>print(...)</code></td><td><code>any...</code></td><td>-</td><td>Print to stdout with newline</td></tr>
+<tr><td><code>len(x)</code></td><td><code>array/string/dict</code></td><td><code>number</code></td><td>Length</td></tr>
+<tr><td><code>push(arr, val)</code></td><td><code>array, any</code></td><td>-</td><td>Append to array</td></tr>
+<tr><td><code>type(x)</code></td><td><code>any</code></td><td><code>string</code></td><td>Type name</td></tr>
+<tr><td><code>tostring(x)</code></td><td><code>any</code></td><td><code>string</code></td><td>Convert to string</td></tr>
+<tr><td><code>tonumber(x)</code></td><td><code>string/number</code></td><td><code>number</code></td><td>Convert to number</td></tr>
+<tr><td><code>Err(kind, msg, hint?)</code></td><td><code>string, string, string?</code></td><td><code>error</code></td><td>Create structured error</td></tr>
+<tr><td><code>Error(kind, msg, hint?)</code></td><td><code>string, string, string?</code></td><td><code>error</code></td><td>Alias for Err</td></tr>
+<tr><td><code>assert(cond, msg?)</code></td><td><code>bool, string?</code></td><td>-</td><td>Fatal if false</td></tr>
+<tr><td><code>error(msg)</code></td><td><code>string</code></td><td>-</td><td>Fatal error</td></tr>
+<tr><td><code>input(prompt?)</code></td><td><code>string?</code></td><td><code>string</code></td><td>Read stdin line</td></tr>
+</table>
+
+<h3>math</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>math.abs(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Absolute value</td></tr>
+<tr><td><code>math.floor(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Round down</td></tr>
+<tr><td><code>math.ceil(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Round up</td></tr>
+<tr><td><code>math.sqrt(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Square root</td></tr>
+<tr><td><code>math.sin(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Sine (radians)</td></tr>
+<tr><td><code>math.cos(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Cosine (radians)</td></tr>
+<tr><td><code>math.tan(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Tangent (radians)</td></tr>
+<tr><td><code>math.pow(x, y)</code></td><td><code>number, number</code></td><td><code>number</code></td><td>Exponentiation</td></tr>
+<tr><td><code>math.min(...)</code></td><td><code>number...</code></td><td><code>number</code></td><td>Smallest argument</td></tr>
+<tr><td><code>math.max(...)</code></td><td><code>number...</code></td><td><code>number</code></td><td>Largest argument</td></tr>
+<tr><td><code>math.random(low?, high?)</code></td><td><code>number...</code></td><td><code>number</code></td><td>Random number</td></tr>
+<tr><td><code>math.randomseed(x)</code></td><td><code>number</code></td><td>-</td><td>Seed random generator</td></tr>
+<tr><td><code>math.round(x)</code></td><td><code>number</code></td><td><code>number</code></td><td>Round to nearest</td></tr>
+<tr><td><code>math.clamp(x, min, max)</code></td><td><code>number, number, number</code></td><td><code>number</code></td><td>Clamp to range</td></tr>
+</table>
+<p>Constants: <code>math.pi</code>, <code>math.huge</code></p>
+
+<h3>string</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>string.len(s)</code></td><td><code>string</code></td><td><code>number</code></td><td>Length</td></tr>
+<tr><td><code>string.lower(s)</code></td><td><code>string</code></td><td><code>string</code></td><td>Lowercase</td></tr>
+<tr><td><code>string.upper(s)</code></td><td><code>string</code></td><td><code>string</code></td><td>Uppercase</td></tr>
+<tr><td><code>string.sub(s, i, j?)</code></td><td><code>string, number...</code></td><td><code>string</code></td><td>Substring (1-based)</td></tr>
+<tr><td><code>string.find(s, p)</code></td><td><code>string, string</code></td><td><code>number</code></td><td>Find substring (1-based)</td></tr>
+<tr><td><code>string.trim(s)</code></td><td><code>string</code></td><td><code>string</code></td><td>Trim whitespace</td></tr>
+<tr><td><code>string.byte(s, i?)</code></td><td><code>string...</code></td><td><code>number</code></td><td>Byte value at position</td></tr>
+<tr><td><code>string.char(...)</code></td><td><code>number...</code></td><td><code>string</code></td><td>Character from byte</td></tr>
+<tr><td><code>string.split(s, d)</code></td><td><code>string, string</code></td><td><code>array</code></td><td>Split by delimiter</td></tr>
+<tr><td><code>string.contains(s, needle)</code></td><td><code>string, string</code></td><td><code>bool</code></td><td>Contains substring</td></tr>
+<tr><td><code>string.starts_with(s, prefix)</code></td><td><code>string, string</code></td><td><code>bool</code></td><td>Starts with prefix</td></tr>
+<tr><td><code>string.ends_with(s, suffix)</code></td><td><code>string, string</code></td><td><code>bool</code></td><td>Ends with suffix</td></tr>
+<tr><td><code>string.repeat(s, n)</code></td><td><code>string, number</code></td><td><code>string</code></td><td>Repeat n times</td></tr>
+<tr><td><code>string.reverse(s)</code></td><td><code>string</code></td><td><code>string</code></td><td>Reverse</td></tr>
+<tr><td><code>string.replace(s, needle, replacement)</code></td><td><code>string, string, string</code></td><td><code>string</code></td><td>Replace substring</td></tr>
+<tr><td><code>string.at(s, index)</code></td><td><code>string, number</code></td><td><code>string, err</code></td><td>Char at index (0-based, fallible)</td></tr>
+</table>
+
+<h3>array</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>array.new()</code></td><td>-</td><td><code>array</code></td><td>Create empty array</td></tr>
+<tr><td><code>array.len(arr)</code></td><td><code>array</code></td><td><code>number</code></td><td>Length</td></tr>
+<tr><td><code>array.push(arr, val)</code></td><td><code>array, any</code></td><td>-</td><td>Append to end</td></tr>
+<tr><td><code>array.pop(arr)</code></td><td><code>array</code></td><td><code>any</code></td><td>Remove and return last</td></tr>
+<tr><td><code>array.insert(arr, i, v)</code></td><td><code>array, number, any</code></td><td>-</td><td>Insert at index (1-based)</td></tr>
+<tr><td><code>array.remove(arr, i)</code></td><td><code>array, number</code></td><td><code>any</code></td><td>Remove at index (1-based)</td></tr>
+<tr><td><code>array.get(arr, index)</code></td><td><code>array, number</code></td><td><code>any, err</code></td><td>Get at index (0-based, fallible)</td></tr>
+<tr><td><code>array.at(arr, index)</code></td><td><code>array, number</code></td><td><code>any, err</code></td><td>Get at index (0-based, fallible)</td></tr>
+<tr><td><code>array.clear(arr)</code></td><td><code>array</code></td><td>-</td><td>Remove all elements</td></tr>
+<tr><td><code>array.contains(arr, value)</code></td><td><code>array, any</code></td><td><code>bool</code></td><td>Contains value</td></tr>
+<tr><td><code>array.index_of(arr, value)</code></td><td><code>array, any</code></td><td><code>number/null</code></td><td>First index of value</td></tr>
+<tr><td><code>array.first(arr)</code></td><td><code>array</code></td><td><code>any/null</code></td><td>First element</td></tr>
+<tr><td><code>array.last(arr)</code></td><td><code>array</code></td><td><code>any/null</code></td><td>Last element</td></tr>
+<tr><td><code>array.extend(arr, other)</code></td><td><code>array, array</code></td><td><code>array</code></td><td>Append all from other</td></tr>
+<tr><td><code>array.slice(arr, start, end?)</code></td><td><code>array, number, number?</code></td><td><code>array</code></td><td>Sub-array (0-based)</td></tr>
+</table>
+
+<h3>dict</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>dict.new()</code></td><td>-</td><td><code>dict</code></td><td>Create empty dict</td></tr>
+<tr><td><code>dict.has(d, key)</code></td><td><code>dict, string</code></td><td><code>bool</code></td><td>Key exists</td></tr>
+<tr><td><code>dict.get(d, key, def?)</code></td><td><code>dict, string...</code></td><td><code>any</code></td><td>Get value or default</td></tr>
+<tr><td><code>dict.set(d, key, val)</code></td><td><code>dict, string, any</code></td><td>-</td><td>Set key-value pair</td></tr>
+<tr><td><code>dict.delete(d, key)</code></td><td><code>dict, string</code></td><td>-</td><td>Remove key</td></tr>
+<tr><td><code>dict.keys(d)</code></td><td><code>dict</code></td><td><code>array</code></td><td>All keys</td></tr>
+<tr><td><code>dict.values(d)</code></td><td><code>dict</code></td><td><code>array</code></td><td>All values</td></tr>
+<tr><td><code>dict.require(d, key)</code></td><td><code>dict, string</code></td><td><code>any, err</code></td><td>Get value (fallible, for <code>?</code>)</td></tr>
+<tr><td><code>dict.len(d)</code></td><td><code>dict</code></td><td><code>number</code></td><td>Number of entries</td></tr>
+<tr><td><code>dict.clear(d)</code></td><td><code>dict</code></td><td>-</td><td>Remove all entries</td></tr>
+<tr><td><code>dict.clone(d)</code></td><td><code>dict</code></td><td><code>dict</code></td><td>Shallow copy</td></tr>
+<tr><td><code>dict.merge(target, source)</code></td><td><code>dict, dict</code></td><td><code>dict</code></td><td>Merge source into target</td></tr>
+</table>
+
+<h3>io</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>io.write(...)</code></td><td><code>any...</code></td><td>-</td><td>Write to stdout (no newline)</td></tr>
+<tr><td><code>io.read_line()</code></td><td>-</td><td><code>string</code></td><td>Read a line from stdin</td></tr>
+<tr><td><code>io.read_file(path)</code></td><td><code>string</code></td><td><code>string, err</code></td><td>Read entire file</td></tr>
+<tr><td><code>io.write_file(path, text)</code></td><td><code>string, string</code></td><td><code>true, err</code></td><td>Write entire file</td></tr>
+<tr><td><code>io.append_file(path, text)</code></td><td><code>string, string</code></td><td><code>true, err</code></td><td>Append to file</td></tr>
+</table>
+
+<h3>fs</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>fs.read(path)</code></td><td><code>string</code></td><td><code>string, err</code></td><td>Read entire file</td></tr>
+<tr><td><code>fs.write(path, text)</code></td><td><code>string, string</code></td><td><code>true, err</code></td><td>Write entire file</td></tr>
+<tr><td><code>fs.append(path, text)</code></td><td><code>string, string</code></td><td><code>true, err</code></td><td>Append to file</td></tr>
+<tr><td><code>fs.exists(path)</code></td><td><code>string</code></td><td><code>bool, err</code></td><td>File exists</td></tr>
+<tr><td><code>fs.remove(path)</code></td><td><code>string</code></td><td><code>true, err</code></td><td>Delete file</td></tr>
+<tr><td><code>fs.rename(from, to)</code></td><td><code>string, string</code></td><td><code>true, err</code></td><td>Rename file</td></tr>
+<tr><td><code>fs.cwd()</code></td><td>-</td><td><code>string, err</code></td><td>Current working directory</td></tr>
+</table>
+
+<h3>path</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>path.join(...)</code></td><td><code>string...</code></td><td><code>string, err</code></td><td>Join path segments</td></tr>
+<tr><td><code>path.basename(p)</code></td><td><code>string</code></td><td><code>string, err</code></td><td>File name from path</td></tr>
+<tr><td><code>path.dirname(p)</code></td><td><code>string</code></td><td><code>string, err</code></td><td>Directory from path</td></tr>
+<tr><td><code>path.ext(p)</code></td><td><code>string</code></td><td><code>string, err</code></td><td>Extension from path</td></tr>
+</table>
+
+<h3>os</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>os.clock()</code></td><td>-</td><td><code>number</code></td><td>CPU time</td></tr>
+<tr><td><code>os.time()</code></td><td>-</td><td><code>number</code></td><td>Unix timestamp</td></tr>
+<tr><td><code>os.getenv(name)</code></td><td><code>string</code></td><td><code>string/null</code></td><td>Environment variable</td></tr>
+</table>
+
+<h3>process</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>process.clock()</code></td><td>-</td><td><code>number</code></td><td>CPU time</td></tr>
+<tr><td><code>process.time()</code></td><td>-</td><td><code>number</code></td><td>Unix timestamp</td></tr>
+<tr><td><code>process.getenv(name)</code></td><td><code>string</code></td><td><code>string/null</code></td><td>Environment variable</td></tr>
+<tr><td><code>process.cwd()</code></td><td>-</td><td><code>string, err</code></td><td>Current working directory</td></tr>
+<tr><td><code>process.platform()</code></td><td>-</td><td><code>string, err</code></td><td>Platform identifier</td></tr>
+</table>
+
+<h3>task</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>task.run(fn)</code></td><td><code>function</code></td><td>-</td><td>Queue function on same VM (cooperative, not a thread)</td></tr>
+</table>
+
+<h3>coroutine</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>coroutine.create(fn)</code></td><td><code>function</code></td><td><code>coroutine, err</code></td><td>Create a coroutine</td></tr>
+<tr><td><code>coroutine.resume(co)</code></td><td><code>coroutine</code></td><td><code>any...</code></td><td>Resume execution</td></tr>
+<tr><td><code>coroutine.yield(values...)</code></td><td><code>any...</code></td><td>-</td><td>Yield back to caller</td></tr>
+<tr><td><code>coroutine.status(co)</code></td><td><code>coroutine</code></td><td><code>string, err</code></td><td>Coroutine state</td></tr>
+</table>
+
+<h3>vm</h3>
+<table>
+<tr><th>Function</th><th>Args</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>vm.spawn(path)</code></td><td><code>string</code></td><td><code>vm_task, err</code></td><td>Spawn isolated VM on a native thread</td></tr>
+<tr><td><code>vm.status(handle)</code></td><td><code>vm_task</code></td><td><code>string, err</code></td><td>Task status</td></tr>
+<tr><td><code>vm.join(handle, timeout_ms?)</code></td><td><code>vm_task, number?</code></td><td><code>true/null, err</code></td><td>Wait for completion</td></tr>
+<tr><td><code>vm.try_join(handle)</code></td><td><code>vm_task</code></td><td><code>bool, err</code></td><td>Non-blocking join check</td></tr>
+<tr><td><code>vm.cancel(handle)</code></td><td><code>vm_task</code></td><td><code>bool, err</code></td><td>Request cooperative cancel</td></tr>
+</table>
+
+<h3>No public table namespace</h3>
+<p>Use <code>array.*</code> for arrays and <code>dict.*</code> for dicts. Magnesium does not expose Lua-style tables as a public data model.</p>
+
+<h2>Concurrency Model</h2>
+<p>Magnesium has three distinct concurrency mechanisms. They are not interchangeable:</p>
+
+<table>
+<tr><th>Mechanism</th><th>Isolation</th><th>Threading</th><th>Use case</th></tr>
+<tr><td><code>task.run(fn)</code></td><td>Same VM</td><td>Cooperative queue</td><td>Deferred work within one VM</td></tr>
+<tr><td><code>coroutine.create/resume/yield</code></td><td>Same VM</td><td>Cooperative pause/resume</td><td>Iterators, generators, state machines</td></tr>
+<tr><td><code>vm.spawn/status/join/cancel</code></td><td>Separate VM</td><td>Native thread</td><td>Isolated parallel work, engine integration</td></tr>
+</table>
+
+<h2>Idiomatic Patterns</h2>
+
+<h3>Fallible lookup with propagation</h3>
+<pre><code>fn require_config(config, key)
+    return dict.require(config, key)?
+end
+</code></pre>
+
+<h3>Struct with methods</h3>
+<pre><code>struct Vec2 x y end
+
+fn Vec2.length(self)
+    return math.sqrt(self.x * self.x + self.y * self.y)
+end
+
+let v = Vec2 { x = 3, y = 4 }
+print(v.length())   // 5
+</code></pre>
+
+<h3>Resource cleanup with defer</h3>
+<pre><code>fn process_file(path)
+    let text = io.read_file(path)?
+    defer print("done with " + path)
+    // ... work with text ...
+end
+</code></pre>
+
+<h3>Isolated VM task</h3>
+<pre><code>let handle, spawn_err = vm.spawn("scripts/worker.mg")
+if spawn_err then
+    print(spawn_err.report)
+    return
+end
+
+let ok, join_err = vm.join(handle, 5000)
+if join_err then
+    print(join_err.report)
+end
+</code></pre>
+
+<h2>Design Rationale</h2>
+
+<p>Each syntax choice in Magnesium has a reason. Understanding these helps generate idiomatic code.</p>
+
+<h3>Comments: <code>//</code> and <code>//[[ ]]</code></h3>
+<p><code>//</code> is familiar to many programmers and easy to scan. The block form <code>//[[ ]]</code> avoids conflicting with division or normal brackets.</p>
+
+<h3>Variables: <code>let</code> and <code>const</code></h3>
+<p>Locals are the safest default. They keep scripts predictable and make functions easier to test. <code>const</code> catches accidental reassignment early.</p>
+
+<h3>Globals: <code>@</code> prefix</h3>
+<p>Implicit globals are convenient at first and painful later. The <code>@</code> prefix makes shared state visible in code review and in a game engine embedding context. Use globals sparingly - prefer modules and explicit function arguments.</p>
+
+<h3>Numbers: single type</h3>
+<p>One simple <code>number</code> type to scripts. The VM can internally optimize integer-shaped values while still exposing a uniform interface.</p>
+
+<h3>Strings: <code>+</code> and <code>_""</code></h3>
+<p>Normal strings stay simple with <code>+</code> for concatenation. Interpolation is explicit at the opening quote with <code>_""</code> - you always know a string interpolates from its first character.</p>
+
+<h3>Booleans and null</h3>
+<p><code>false</code> and <code>null</code> are falsey. Other values are truthy. This matches common scripting expectations while keeping condition checks cheap.</p>
+
+<h3>Word-based logical operators</h3>
+<p><code>and</code>, <code>or</code>, <code>not</code> are readable in scripts and avoid punctuation-heavy conditions.</p>
+
+<h3>Compound assignment</h3>
+<p><code>+=</code>, <code>-=</code>, <code>*=</code>, <code>/=</code>, <code>%=</code> are common in game and simulation code. They also give the compiler clear opportunities for bytecode optimization (e.g. <code>OP_ADDLOCAL</code> instead of load + add + store).</p>
+
+<h3>Blocks: <code>then</code> / <code>end</code></h3>
+<p><code>then</code> and <code>end</code> make block boundaries explicit without braces while keeping scripts beginner-readable.</p>
+
+<h3>Loop</h3>
+<p>An infinite loop should look explicit. Use <code>loop</code> when the exit condition is inside the body.</p>
+
+<h3>Range operators: <code>..</code> and <code>..=</code></h3>
+<p>Both exclusive and inclusive ranges are useful. The syntax makes the inclusive version visible at a glance.</p>
+
+<h3>Collection loops</h3>
+<p>Script authors should not have to manually manage iterators for common collection traversal. <code>for item in arr</code> and <code>for key, value in dict</code> handle it.</p>
+
+<h3>First-class functions</h3>
+<p>Functions are values. This supports callbacks, task scheduling, and host APIs without adding a class-heavy model.</p>
+
+<h3>Multi-return and <code>value, err</code></h3>
+<p>If a caller asks for more values than a function returns, missing values become <code>null</code>. This keeps the <code>value, err</code> pattern lightweight without forcing every success return to write <code>, null</code>.</p>
+
+<h3>Error values, not exceptions</h3>
+<p>Recoverable failure is explicit: return useful values on success, and return <code>null, err</code> when an operation cannot produce a value. <code>?</code> reduces the repetitive plumbing where it makes sense.</p>
+
+<h3>The <code>?</code> operator</h3>
+<p><code>?</code> should stand in for repetitive error plumbing. It uses early propagation while preserving Magnesium's multi-return style. Only actual <code>Err</code> objects propagate - extra non-error return values remain normal multi-return values, so <code>?</code> never mistakes a legitimate second return for a failure.</p>
+
+<h3>Dict syntax: <code>&amp;&lt; &gt;</code></h3>
+<p><code>&lt;</code> and <code>&gt;</code> are already comparison operators. The <code>&amp;</code> makes dict literals visually and grammatically distinct.</p>
+
+<h3>Structs</h3>
+<p>Structs are for fixed shapes. They are faster and more predictable than dicts when fields are known. Dicts are for dynamic data.</p>
+
+<h3>Methods</h3>
+<p>Method syntax (<code>fn Type.method(self, ...)</code>) keeps data and behavior readable without requiring a full class system.</p>
+
+<h3>Enums</h3>
+<p>Enums make named states clearer than raw strings.</p>
+
+<h3>Defer</h3>
+<p><code>defer</code> is useful for cleanup-like code and helps scripts keep setup and cleanup close together.</p>
+
+<h3>Modules</h3>
+<p>Each file can hide private helpers and expose a small API. Imported modules are cached so repeated imports share exports.</p>
+
+<h3>Concurrency split</h3>
+<p><code>task.run</code>, <code>coroutine</code>, and <code>vm.spawn</code> are different tools and should not be hidden behind one ambiguous <code>spawn</code>. Task runs cooperative same-VM work. Coroutines pause/resume inside one VM. VM spawn creates an isolated runtime with separate globals/imports/heap and cooperative cancellation.</p>
+
+<h3>FFI</h3>
+<p>Production hosts should register native functions, native handles, and globals explicitly. Scripts use <code>extern fn</code> and <code>extern const</code> to describe those host-provided symbols for strict checking and LSP support. Raw numeric FFI is available for narrow C function-pointer calls. Script-level C header/library imports are experimental.</p>
+
+<h2>Style Guide</h2>
+
+<p>When generating Magnesium code, follow these conventions:</p>
+
+<h3>Prefer <code>?</code> over manual error plumbing</h3>
+<pre><code>// PREFERRED
+fn get_player(players, name)
+    return players&lt;name&gt;?
+end
+
+// AVOID
+fn get_player(players, name)
+    let player = players&lt;name&gt;
+    if player == null then return null, "Key not found: " + name end
+    return player, null
+end
+</code></pre>
+
+<h3>Prefer local variables</h3>
+<pre><code>let speed = 10
+</code></pre>
+
+<h3>Use globals only when shared state is intentional</h3>
+<pre><code>let @debug = true
+</code></pre>
+
+<h3>Prefer structs for stable shapes</h3>
+<pre><code>struct Vec2
+    x
+    y
+end
+</code></pre>
+
+<h3>Prefer dicts for dynamic data</h3>
+<pre><code>let tags = &amp;&lt; boss = true, flying = false &gt;
+</code></pre>
+
+<h2>Key Differences from Lua</h2>
+<ul>
+<li>Variables are local by default; globals need <code>@</code> prefix.</li>
+<li>Dict syntax is <code>&amp;&lt; key = val &gt;</code> and <code>d&lt;"key"&gt;</code> - not <code>{}</code> and <code>d.key</code>.</li>
+<li>Error handling uses <code>value, err</code> multi-return and <code>?</code> - no <code>pcall</code>/<code>xpcall</code>.</li>
+<li>Arrays are 0-indexed for <code>[]</code> access.</li>
+<li><code>string.at</code> is 0-based; <code>string.sub</code>/<code>string.find</code>/<code>string.byte</code> are 1-based.</li>
+<li>Has <code>defer</code>, <code>try</code>/<code>catch</code>, <code>struct</code>, <code>enum</code>, and <code>?</code> - Lua does not.</li>
+<li>Interpolated strings use <code>_"..."</code> instead of string formatting functions.</li>
+<li>Boolean operators are <code>and</code>/<code>or</code>/<code>not</code> (same as Lua), but <code>~=</code> becomes <code>!=</code>.</li>
+<li>Blocks use <code>then</code>/<code>end</code> like Lua (not <code>do</code>/<code>end</code>).</li>
+</ul>
+
+<h2>CLI Usage</h2>
+<pre><code>magnesium script.mg           # Run a script
+magnesium script.mgc          # Run compiled bytecode
+magnesium build script.mg     # Compile to script.mgc
+magnesium -c script.mg        # Syntax check only
+magnesium -                   # Run from stdin
+magnesium --version           # Print version
+magnesium --time script.mg    # Time execution
+</code></pre>
+
+</body>
+</html>

@@ -1,0 +1,3 @@
+[line 8] Error: Type error: Missing required field 'score' for data shape.
+[line 12] Error: Type error: Expected number for initializer, got string.
+[line 13] Error: Type error: Cannot call number value.

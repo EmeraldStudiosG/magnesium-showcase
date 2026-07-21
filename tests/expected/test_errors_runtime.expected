@@ -1,0 +1,2 @@
+Cannot call value of type number. Only functions and structs are callable.
+[line 1] in tests/test_errors_runtime.mg()

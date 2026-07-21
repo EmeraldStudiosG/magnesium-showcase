@@ -1,0 +1,31 @@
+# Skip everything not needed to build+benchmark to keep context small
+.git/
+.gitignore
+.gitattributes
+docs/
+examples/
+lsp/
+bindings/
+scripts/serve_docs.*
+scripts/lsp_smoke.py
+QA_INSTALL_INSTRUCTIONS.txt
+interpreter_vm_research.md
+
+# Pre-built / stale build artifacts (rebuilt inside container)
+*.exe
+*.dll
+mt
+mt.exe
+magnesium
+magnesium.exe
+libmagnesium.so
+libmagnesium.dylib
+benchmark/__pycache__/
+benchmark/*.mgc
+benchmark/*.luac
+benchmark/*.luajit
+
+# Tooling
+.opencode/
+.vscode/
+.idea/

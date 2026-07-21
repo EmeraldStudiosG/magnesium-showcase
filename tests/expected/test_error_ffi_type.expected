@@ -1,0 +1,2 @@
+FFI sqrt argument 1 expected number, got string.
+[line 3] in tests/test_error_ffi_type.mg()

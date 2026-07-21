@@ -1,0 +1,37 @@
+# Misc
+/md
+
+# Binaries
+/magnesium
+/mt
+magnesium_test_switch
+*.o
+*.exe
+*.tmp*
+.mgc
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Documentation build
+site/
+docs/book/
+
+# IDEs
+.vscode/
+.idea/
+build/
+
+# Rust
+bindings/rust/target/
+**/*.rs.bk
+Cargo.lock
+vm_papers_md/
+
+# .NET / C# build output
+bindings/**/bin/
+bindings/**/obj/
+
+# WIP / TODO

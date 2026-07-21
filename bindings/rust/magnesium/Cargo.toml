@@ -1,0 +1,14 @@
+[package]
+name = "magnesium"
+version = "1.0.0"
+edition = "2021"
+description = "Safe Rust wrapper for the Magnesium language VM"
+
+[features]
+default = ["vendored"]
+vendored = ["magnesium-sys/vendored"]
+system = ["magnesium-sys/system"]
+
+[dependencies]
+magnesium-sys = { path = "../magnesium-sys" }
+libc = "0.2"

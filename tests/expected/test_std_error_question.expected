@@ -1,0 +1,14 @@
+Magnesium
+null
+null
+KeyError
+Key not found: name
+b
+null
+IndexError
+Check array.len(items) before reading this index.
+c
+null
+null
+IndexError
+Check string.len(text) before reading this index.

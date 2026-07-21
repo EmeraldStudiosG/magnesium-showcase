@@ -1,0 +1,21 @@
+Ada
+null
+null
+error[KeyError]: Key not found: age
+  at tests/test_question_try.mg:8
+  hint: Check dict.has(dict, key) or provide a default value.
+null
+error[TypeError]: Dictionary key must be a string
+  at tests/test_question_try.mg:12
+20
+null
+null
+error[IndexError]: Index out of range: 9
+  at tests/test_question_try.mg:20
+  hint: Check the array length before reading this index.
+g
+null
+null
+error[IndexError]: Index out of range: 9
+  at tests/test_question_try.mg:24
+  hint: Check the string length before reading this index.

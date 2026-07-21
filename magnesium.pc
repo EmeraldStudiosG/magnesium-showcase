@@ -1,0 +1,9 @@
+prefix=@PREFIX@
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: magnesium
+Description: Magnesium language VM
+Version: 1.0.0
+Libs: -L${libdir} -lmagnesium -lm -ldl -pthread
+Cflags: -I${includedir}

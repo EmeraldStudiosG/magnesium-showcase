@@ -1,0 +1,2 @@
+Operator '+' expected a number, got string.
+[line 1] in tests/test_error_type.mg()

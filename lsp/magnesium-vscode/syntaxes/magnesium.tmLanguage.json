@@ -1,0 +1,276 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Magnesium",
+  "scopeName": "source.mg",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#constants" },
+    { "include": "#builtin-functions" },
+    { "include": "#stdlib-namespaces" },
+    { "include": "#function-declaration" },
+    { "include": "#method-declaration" },
+    { "include": "#type-alias" },
+    { "include": "#extern-declaration" },
+    { "include": "#struct-declaration" },
+    { "include": "#enum-declaration" },
+    { "include": "#keywords" },
+    { "include": "#struct-instantiation" },
+    { "include": "#function-call" },
+    { "include": "#dict-literal" },
+    { "include": "#globals" },
+    { "include": "#property-access" },
+    { "include": "#identifiers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.mg",
+          "begin": "//\\[\\[",
+          "end": "\\]\\]"
+        },
+        {
+          "name": "comment.line.double-slash.mg",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.interpolated.mg",
+          "begin": "_\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.mg",
+              "match": "\\\\."
+            },
+            {
+              "begin": "\\{",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.embedded.begin.mg" }
+              },
+              "end": "\\}",
+              "endCaptures": {
+                "0": { "name": "punctuation.section.embedded.end.mg" }
+              },
+              "patterns": [
+                { "include": "$self" }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.mg",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.mg",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.mg",
+          "match": "\\b\\d+(\\.\\d+)?([eE][+-]?\\d+)?\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.mg",
+          "match": "\\b(true|false|null)\\b"
+        },
+        {
+          "name": "support.function.error.mg",
+          "match": "\\b(Err|Error)\\b"
+        },
+        {
+          "name": "variable.language.self.mg",
+          "match": "\\bself\\b"
+        }
+      ]
+    },
+    "builtin-functions": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.mg",
+          "match": "\\b(print|len|push|type|tostring|tonumber|assert|error|input)\\b"
+        }
+      ]
+    },
+    "stdlib-namespaces": {
+      "patterns": [
+        {
+          "name": "support.module.mg",
+          "match": "\\b(math|string|array|dict|io|fs|path|os|process|task|coroutine|vm)\\b"
+        }
+      ]
+    },
+    "type-alias": {
+      "match": "\\b(type)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "entity.name.type.mg" }
+      }
+    },
+    "extern-declaration": {
+      "match": "\\b(extern)\\s+(fn|const)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "keyword.declaration.mg" },
+        "3": { "name": "entity.name.function.mg" }
+      }
+    },
+    "function-declaration": {
+      "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "entity.name.function.mg" }
+      }
+    },
+    "method-declaration": {
+      "match": "\\b(fn)\\s+([a-zA-Z_][a-zA-Z0-9_]*)\\.(\\s*[a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "entity.name.type.mg" },
+        "3": { "name": "entity.name.function.mg" }
+      }
+    },
+    "struct-declaration": {
+      "match": "\\b(struct)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "entity.name.type.mg" }
+      }
+    },
+    "enum-declaration": {
+      "match": "\\b(enum)\\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.mg" },
+        "2": { "name": "entity.name.type.mg" }
+      }
+    },
+    "struct-instantiation": {
+      "match": "\\b([A-Z][a-zA-Z0-9_]*)\\s*(\\{)",
+      "captures": {
+        "1": { "name": "entity.name.type.mg" },
+        "2": { "name": "punctuation.definition.struct.begin.mg" }
+      }
+    },
+    "function-call": {
+      "match": "\\b([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.mg" }
+      }
+    },
+    "dict-literal": {
+      "patterns": [
+        {
+          "match": "(&)(<)",
+          "captures": {
+            "1": { "name": "punctuation.definition.dict.begin.mg" },
+            "2": { "name": "punctuation.definition.dict.begin.mg" }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.mg",
+          "match": "\\b(if|then|else|elseif|end|for|in|loop|break|continue|return|try|catch|defer)\\b"
+        },
+        {
+          "name": "keyword.declaration.mg",
+          "match": "\\b(let|const|fn|struct|enum|export|import|type|extern)\\b"
+        },
+        {
+          "name": "keyword.control.directive.mg",
+          "match": "!(strict|nocheck)\\b"
+        },
+        {
+          "name": "storage.type.mg",
+          "match": "\\b(number|string|bool|any|unknown)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.mg",
+          "match": "\\b(and|or|not)\\b"
+        },
+        {
+          "name": "keyword.other.mg",
+          "match": "\\b(as)\\b"
+        }
+      ]
+    },
+    "globals": {
+      "patterns": [
+        {
+          "name": "variable.other.global.mg",
+          "match": "@[a-zA-Z_][a-zA-Z0-9_]*"
+        }
+      ]
+    },
+    "property-access": {
+      "match": "(\\.)([a-zA-Z_][a-zA-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.mg" },
+        "2": { "name": "variable.other.property.mg" }
+      }
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.name.mg",
+          "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.fallible.mg",
+          "match": "\\?"
+        },
+        {
+          "name": "keyword.operator.compound-assignment.mg",
+          "match": "(\\+=|-=|\\*=|/=|%=)"
+        },
+        {
+          "name": "keyword.operator.range.mg",
+          "match": "(\\.\\.=|\\.\\.)"
+        },
+        {
+          "name": "keyword.operator.comparison.mg",
+          "match": "(==|!=|<=|>=|<|>)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.mg",
+          "match": "(\\+|-|\\*|/|%)"
+        },
+        {
+          "name": "keyword.operator.assignment.mg",
+          "match": "(=)"
+        },
+        {
+          "name": "keyword.operator.logical.not.mg",
+          "match": "(!)"
+        },
+        {
+          "name": "punctuation.angle-bracket.mg",
+          "match": "[<>]"
+        }
+      ]
+    }
+  }
+}
