@@ -1,1 +1,7 @@
 bindings/** linguist-vendored=true
+
+# Keep scripts and build entry points executable on POSIX checkouts, even when
+# contributors use Git's Windows line-ending conversion.
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile* text eol=lf

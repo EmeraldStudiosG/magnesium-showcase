@@ -211,7 +211,11 @@ pub enum ObjType {
 pub struct Obj {
     pub type_: ObjType,
     pub is_marked: bool,
+    pub is_old: bool,
+    pub size_class: u8,
+    pub gc_age: u8,
     pub next: *mut Obj,
+    pub alloc_size: size_t,
 }
 
 // String
@@ -243,6 +247,7 @@ pub struct ObjArray {
 #[derive(Debug)]
 pub struct DictEntry {
     pub key: *mut ObjString,
+    pub hash: u32,
     pub value: Value,
 }
 
@@ -255,7 +260,10 @@ pub struct ObjDict {
     pub version: u32,
     pub mono_cache_key: *mut ObjString,
     pub mono_cache_entry: *mut DictEntry,
-    pub mono_cache_version: u32,
+    pub mono_cache_value: Value,
+    pub indices: *mut i32,
+    pub entry_count: c_int,
+    pub entry_capacity: c_int,
     pub entries: *mut DictEntry,
 }
 
@@ -264,6 +272,7 @@ pub struct ObjDict {
 #[derive(Debug)]
 pub struct TableEntry {
     pub key: *mut ObjString,
+    pub hash: u32,
     pub value: Value,
 }
 
@@ -378,8 +387,9 @@ pub type NativeHandleFinalizer = Option<unsafe extern "C" fn(data: *mut c_void)>
 pub struct ObjNative {
     pub obj: Obj,
     pub function: NativeFn,
-    pub name: *const c_char,
+    pub name: *mut ObjString,
     pub arity: c_int,
+    pub copy_args: bool,
     pub userdata: *mut c_void,
     pub userdata_finalizer: Option<unsafe extern "C" fn(data: *mut c_void)>,
 }
@@ -390,7 +400,7 @@ pub struct ObjNative {
 pub struct ObjFFI {
     pub obj: Obj,
     pub c_function: *mut c_void,
-    pub name: *const c_char,
+    pub name: *mut ObjString,
     pub arity: c_int,
 }
 
@@ -559,52 +569,18 @@ pub struct VmTaskArray {
     pub capacity: c_int,
 }
 
-// VM
+#[repr(C)]
+#[derive(Debug)]
+pub struct VMRoot {
+    pub value: Value,
+    pub next: *mut VMRoot,
+}
+
+// VM is intentionally opaque. Its layout contains C atomics and private
+// allocator state and is not part of the stable pointer-based C API.
 #[repr(C)]
 pub struct VM {
-    pub frames: [CallFrame; 256],
-    pub frame_count: c_int,
-    pub stack: *mut Value,
-    pub stack_size: c_int,
-    pub stack_capacity: c_int,
-    pub stack_top: c_int,
-    pub globals: Table,
-    pub global_ic: [GlobalICEntry; 128],
-    pub field_ic: [FieldICEntry; 128],
-    pub method_ic: [MethodICEntry; 128],
-    pub dict_ic: [DictICEntry; 256],
-    pub modules: Table,
-    pub strings: Table,
-    pub open_upvalues: *mut ObjUpvalue,
-    pub current_coroutine: *mut ObjCoroutine,
-    pub yield_requested: bool,
-    pub yield_values: [Value; 256],
-    pub yield_count: c_int,
-    pub native_return_values: [Value; 256],
-    pub native_return_count: c_int,
-    pub saved_contexts: *mut SavedVMContext,
-    pub cancel_requested: bool,
-    pub deadline_ms: u64,
-    pub upvalue_cache: *mut *mut ObjUpvalue,
-    pub upvalue_cache_capacity: c_int,
-    pub defer_stack: ClosureArray,
-    pub task_queue: ClosureArray,
-    pub vm_tasks: VmTaskArray,
-    pub closure_free_list: *mut ObjClosure,
-    pub upvalue_free_list: *mut ObjUpvalue,
-    pub closure_free_list_count: c_int,
-    pub upvalue_free_list_count: c_int,
-    pub objects: *mut Obj,
-    pub bytes_allocated: size_t,
-    pub next_gc: size_t,
-    pub gray_stack: *mut *mut Obj,
-    pub gray_count: c_int,
-    pub gray_capacity: c_int,
-    pub last_error_message: [c_char; 512],
-    pub last_error_trace: [c_char; 2048],
-    pub last_error_file: [c_char; 256],
-    pub last_error_function: [c_char; 128],
-    pub last_error_line: c_int,
+    _private: [u8; 0],
 }
 
 // InterpretResult
@@ -683,6 +659,11 @@ pub enum OpCode {
     ForaddlocalFieldPropInc,
     ForaddglobalFieldProp,
     ForaddglobalFieldPropInc,
+    ForModiAccum,
+    ForModiAccumInc,
+    ForField2Accum,
+    ForField2AccumInc,
+    ArrayMarkFalseStride,
     Closure,
     Call,
     Callg,
@@ -718,12 +699,25 @@ pub enum OpCode {
     Setfield,
     GetfieldIdx,
     SetfieldIdx,
+    Addsub,
+    Subadd,
+    Muladd,
+    Mulsub,
+    AddGtTest,
+    AddGeTest,
+    SubGtTest,
+    SubGeTest,
+    MullocalAdd,
+    MullocalSub,
     IterPrep,
     IterNext,
     Aux,
     CloseUpval,
     Defer,
     Newstruct,
+    Mcallfield,
+    Mcallfield0,
+    AddiLoop,
     Count,
 }
 

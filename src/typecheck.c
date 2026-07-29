@@ -44,6 +44,7 @@ typedef struct {
     TcType *type;
     bool annotated;
     bool is_const;
+    bool is_global;
     int depth;
 } TcSymbol;
 
@@ -179,11 +180,35 @@ static TcAlias *find_alias(Checker *checker, const char *name) {
     return NULL;
 }
 
-static TcSymbol *find_symbol(Checker *checker, const char *name) {
+static TcSymbol *find_symbol_ns(Checker *checker, const char *name, bool explicit_global) {
+    if (explicit_global) {
+        for (int i = checker->symbol_count - 1; i >= 0; i--) {
+            if (checker->symbols[i].is_global &&
+                strcmp(checker->symbols[i].name, name) == 0) {
+                return &checker->symbols[i];
+            }
+        }
+        return NULL;
+    }
+
+    /* Ordinary names resolve lexical bindings before the global namespace. */
     for (int i = checker->symbol_count - 1; i >= 0; i--) {
-        if (strcmp(checker->symbols[i].name, name) == 0) return &checker->symbols[i];
+        if (!checker->symbols[i].is_global &&
+            strcmp(checker->symbols[i].name, name) == 0) {
+            return &checker->symbols[i];
+        }
+    }
+    for (int i = checker->symbol_count - 1; i >= 0; i--) {
+        if (checker->symbols[i].is_global &&
+            strcmp(checker->symbols[i].name, name) == 0) {
+            return &checker->symbols[i];
+        }
     }
     return NULL;
+}
+
+static TcSymbol *find_symbol(Checker *checker, const char *name) {
+    return find_symbol_ns(checker, name, false);
 }
 
 static void add_alias(Checker *checker, const char *name, TcType *type) {
@@ -202,12 +227,13 @@ static void add_alias(Checker *checker, const char *name, TcType *type) {
     checker->alias_count++;
 }
 
-static TcSymbol *add_symbol(Checker *checker, const char *name, TcType *type,
-                            bool annotated, bool is_const) {
+static TcSymbol *add_symbol_ns(Checker *checker, const char *name, TcType *type,
+                               bool annotated, bool is_const, bool is_global) {
     TcSymbol *existing = NULL;
     for (int i = checker->symbol_count - 1; i >= 0; i--) {
-        if (checker->symbols[i].depth != checker->depth) break;
-        if (strcmp(checker->symbols[i].name, name) == 0) {
+        if (checker->symbols[i].depth == (is_global ? 0 : checker->depth) &&
+            checker->symbols[i].is_global == is_global &&
+            strcmp(checker->symbols[i].name, name) == 0) {
             existing = &checker->symbols[i];
             break;
         }
@@ -228,8 +254,14 @@ static TcSymbol *add_symbol(Checker *checker, const char *name, TcType *type,
     sym->type = type;
     sym->annotated = annotated;
     sym->is_const = is_const;
-    sym->depth = checker->depth;
+    sym->is_global = is_global;
+    sym->depth = is_global ? 0 : checker->depth;
     return sym;
+}
+
+static TcSymbol *add_symbol(Checker *checker, const char *name, TcType *type,
+                            bool annotated, bool is_const) {
+    return add_symbol_ns(checker, name, type, annotated, is_const, false);
 }
 
 static void begin_scope(Checker *checker) {
@@ -237,11 +269,17 @@ static void begin_scope(Checker *checker) {
 }
 
 static void end_scope(Checker *checker) {
-    while (checker->symbol_count > 0 &&
-           checker->symbols[checker->symbol_count - 1].depth == checker->depth) {
-        free(checker->symbols[checker->symbol_count - 1].name);
-        checker->symbol_count--;
+    int write = 0;
+    for (int i = 0; i < checker->symbol_count; i++) {
+        if (!checker->symbols[i].is_global &&
+            checker->symbols[i].depth == checker->depth) {
+            free(checker->symbols[i].name);
+            continue;
+        }
+        if (write != i) checker->symbols[write] = checker->symbols[i];
+        write++;
     }
+    checker->symbol_count = write;
     checker->depth--;
 }
 
@@ -316,13 +354,36 @@ static bool type_is_string(TcType *type) {
     return type && (type->kind == TC_STRING || type->kind == TC_ANY);
 }
 
+static TcField *find_field(TcType *type, const char *name);
+
 static bool types_compatible(TcType *expected, TcType *actual) {
     if (!expected || !actual) return true;
     if (expected->kind == TC_ANY || actual->kind == TC_ANY) return true;
     if (expected->kind == TC_UNKNOWN) return true;
     if (actual->kind == TC_UNKNOWN) return expected->kind == TC_UNKNOWN || expected->kind == TC_ANY;
     if (expected->kind == TC_SHAPE) {
-        return actual->kind == TC_SHAPE || actual->kind == TC_DICT;
+        /*
+         * An arbitrary dict does not prove that the required fields exist.
+         * Dict literals are validated field-by-field at the assignment/call
+         * site and are handled separately from this general compatibility
+         * check.
+         */
+        if (actual->kind == TC_DICT) return false;
+        if (actual->kind != TC_SHAPE && actual->kind != TC_STRUCT) return false;
+        for (int i = 0; i < expected->field_count; i++) {
+            TcField *field = find_field(actual, expected->fields[i].name);
+            if (!field || !types_compatible(expected->fields[i].type, field->type)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (expected->kind == TC_DICT && actual->kind == TC_SHAPE) {
+        if (!types_compatible(expected->key, &(TcType){.kind = TC_STRING})) return false;
+        for (int i = 0; i < actual->field_count; i++) {
+            if (!types_compatible(expected->value, actual->fields[i].type)) return false;
+        }
+        return true;
     }
     if (expected->kind != actual->kind) return false;
     switch (expected->kind) {
@@ -341,6 +402,12 @@ static bool types_compatible(TcType *expected, TcType *actual) {
             if (!expected->name || !actual->name) return true;
             return strcmp(expected->name, actual->name) == 0;
         case TC_SHAPE:
+            for (int i = 0; i < expected->field_count; i++) {
+                TcField *field = find_field(actual, expected->fields[i].name);
+                if (!field || !types_compatible(expected->fields[i].type, field->type)) {
+                    return false;
+                }
+            }
             return true;
         default:
             return true;
@@ -384,6 +451,8 @@ static ASTNode *dict_literal_find_key(ASTNode *dict, const char *name) {
 static TcType *check_expr(Checker *checker, ASTNode *node);
 static void check_stmt(Checker *checker, ASTNode *node);
 static TcType *convert_param_type(Checker *checker, Param *param);
+static void check_function_body_with_type(Checker *checker, ASTNode *node,
+                                          TcType *fn_type);
 
 static void check_assignable(Checker *checker, int line, TcType *expected, TcType *actual,
                              const char *context) {
@@ -423,8 +492,11 @@ static void check_literal_against_expected(Checker *checker, ASTNode *literal, T
     }
     if (expected->kind == TC_DICT && literal->type == NODE_DICT_LITERAL) {
         for (int i = 0; i < literal->as.dict_literal.entries.count; i++) {
+            ASTNode *key = literal->as.dict_literal.entries.pairs[i].key;
             ASTNode *value = literal->as.dict_literal.entries.pairs[i].value;
+            TcType *actual_key = check_expr(checker, key);
             TcType *actual = check_expr(checker, value);
+            check_assignable(checker, key->line, expected->key, actual_key, "dict key");
             check_assignable(checker, value->line, expected->value, actual, "dict value");
         }
     }
@@ -435,6 +507,26 @@ static TcType *join_element_type(Checker *checker, TcType *a, TcType *b) {
     if (!b) return a;
     if (types_compatible(a, b) && types_compatible(b, a)) return a;
     return tc_any(checker);
+}
+
+static TcType *function_type_from_decl(Checker *checker, ASTNode *node) {
+    int exposed_start =
+        node->as.fn_decl.is_method && node->as.fn_decl.param_count > 0 ? 1 : 0;
+    int param_count = node->as.fn_decl.param_count - exposed_start;
+    if (param_count < 0) param_count = 0;
+
+    TcType **params = NULL;
+    if (param_count > 0) {
+        params = (TcType **)calloc((size_t)param_count, sizeof(TcType *));
+        for (int i = 0; i < param_count; i++) {
+            params[i] =
+                convert_param_type(checker, &node->as.fn_decl.params[i + exposed_start]);
+        }
+    }
+    TcType *return_type = node->as.fn_decl.return_type
+        ? convert_type_ref(checker, node->as.fn_decl.return_type)
+        : tc_any(checker);
+    return tc_function(checker, params, param_count, return_type, false);
 }
 
 static TcType *check_expr(Checker *checker, ASTNode *node) {
@@ -451,7 +543,9 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
             return tc_null(checker);
         case NODE_IDENTIFIER: {
             char *name = copy_token_text(node->as.identifier.name);
-            TcSymbol *sym = name ? find_symbol(checker, name) : NULL;
+            TcSymbol *sym = name
+                ? find_symbol_ns(checker, name, node->as.identifier.is_global)
+                : NULL;
             if (!sym) {
                 checker_error(checker, node->line, "Unknown symbol '%s'.", name ? name : "");
                 free(name);
@@ -494,11 +588,15 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
                         TcType *actual = check_expr(checker, node->as.struct_literal.fields.pairs[i].value);
                         check_assignable(checker, node->as.struct_literal.fields.pairs[i].value->line,
                                          field->type, actual, field->name);
+                    } else {
+                        checker_error(checker, key->line, "Unknown field '%s' on %s.",
+                                      key->as.string.value, tc_type_name(out));
                     }
                 }
                 free(name);
                 return out;
             }
+            checker_error(checker, node->line, "Unknown struct '%s'.", name ? name : "");
             free(name);
             return tc_unknown(checker);
         }
@@ -558,10 +656,16 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
                     return tc_unknown(checker);
             }
         }
-        case NODE_LOGICAL:
-            check_expr(checker, node->as.logical.left);
-            check_expr(checker, node->as.logical.right);
-            return tc_bool(checker);
+        case NODE_LOGICAL: {
+            TcType *left = check_expr(checker, node->as.logical.left);
+            TcType *right = check_expr(checker, node->as.logical.right);
+            if (node->as.logical.left->type == NODE_BOOL) {
+                bool value = node->as.logical.left->as.boolean.value;
+                if (node->as.logical.op == TOKEN_AND) return value ? right : left;
+                return value ? left : right;
+            }
+            return join_element_type(checker, left, right);
+        }
         case NODE_CALL: {
             TcType *callee = check_expr(checker, node->as.call.callee);
             if (callee->kind == TC_ANY) {
@@ -586,8 +690,17 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
             for (int i = 0; i < node->as.call.args.count; i++) {
                 TcType *actual = check_expr(checker, node->as.call.args.nodes[i]);
                 if (i < limit) {
-                    check_assignable(checker, node->as.call.args.nodes[i]->line,
-                                     callee->params[i], actual, "argument");
+                    ASTNode *argument = node->as.call.args.nodes[i];
+                    check_literal_against_expected(checker,
+                                                   argument,
+                                                   callee->params[i]);
+                    bool checked_shape_literal =
+                        callee->params[i]->kind == TC_SHAPE &&
+                        argument->type == NODE_DICT_LITERAL;
+                    if (!checked_shape_literal) {
+                        check_assignable(checker, argument->line,
+                                         callee->params[i], actual, "argument");
+                    }
                 }
             }
             return callee->return_type ? callee->return_type : tc_any(checker);
@@ -615,6 +728,9 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
                 if (node->as.index_expr.index->type == NODE_STRING) {
                     TcField *field = find_field(object, node->as.index_expr.index->as.string.value);
                     if (field) return field->type;
+                    checker_error(checker, node->line,
+                                  "Unknown field '%s' on data shape.",
+                                  node->as.index_expr.index->as.string.value);
                 }
                 return tc_unknown(checker);
             }
@@ -634,9 +750,15 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
             if (object->kind == TC_SHAPE || object->kind == TC_STRUCT) {
                 char *field_name = copy_token_text(node->as.field_get.name);
                 TcField *field = field_name ? find_field(object, field_name) : NULL;
+                if (field) {
+                    TcType *field_type = field->type;
+                    free(field_name);
+                    return field_type;
+                }
+                checker_error(checker, node->line, "Unknown field '%s' on %s.",
+                              field_name ? field_name : "", tc_type_name(object));
                 free(field_name);
-                if (field) return field->type;
-                return object->kind == TC_SHAPE ? tc_unknown(checker) : tc_unknown(checker);
+                return tc_unknown(checker);
             }
             if (object->kind == TC_DICT) return object->value ? object->value : tc_unknown(checker);
             checker_error(checker, node->line, "Cannot access field on %s value.", tc_type_name(object));
@@ -647,6 +769,11 @@ static TcType *check_expr(Checker *checker, ASTNode *node) {
         case NODE_TRY_BLOCK:
             check_stmt(checker, node);
             return tc_any(checker);
+        case NODE_FN_DECL: {
+            TcType *fn_type = function_type_from_decl(checker, node);
+            check_function_body_with_type(checker, node, fn_type);
+            return fn_type;
+        }
         default:
             return tc_unknown(checker);
     }
@@ -656,7 +783,9 @@ static void check_assignment_target(Checker *checker, ASTNode *target, ASTNode *
     TcType *actual = check_expr(checker, value);
     if (target->type == NODE_IDENTIFIER) {
         char *name = copy_token_text(target->as.identifier.name);
-        TcSymbol *sym = name ? find_symbol(checker, name) : NULL;
+        TcSymbol *sym = name
+            ? find_symbol_ns(checker, name, target->as.identifier.is_global)
+            : NULL;
         if (!sym) {
             checker_error(checker, target->line, "Unknown symbol '%s'.", name ? name : "");
             free(name);
@@ -698,7 +827,7 @@ static void check_assignment_target(Checker *checker, ASTNode *target, ASTNode *
             TcField *field = field_name ? find_field(object, field_name) : NULL;
             if (field) {
                 check_assignable(checker, value->line, field->type, actual, field->name);
-            } else if (object->kind == TC_STRUCT) {
+            } else {
                 checker_error(checker, target->line, "Unknown field '%s' on %s.",
                               field_name ? field_name : "", tc_type_name(object));
             }
@@ -717,18 +846,12 @@ static void check_block(Checker *checker, ASTNode *node) {
     }
 }
 
-static void check_function_body(Checker *checker, ASTNode *node) {
-    char *name = copy_token_text(node->as.fn_decl.name);
-    TcSymbol *fn_sym = name ? find_symbol(checker, name) : NULL;
-    TcType *fn_type = fn_sym ? fn_sym->type : NULL;
-    free(name);
-
+static void check_function_body_with_type(Checker *checker, ASTNode *node,
+                                          TcType *fn_type) {
     begin_scope(checker);
     for (int i = 0; i < node->as.fn_decl.param_count; i++) {
         char *param_name = copy_token_text(node->as.fn_decl.params[i].name);
-        TcType *param_type = fn_type && fn_type->kind == TC_FUNCTION && i < fn_type->param_count
-            ? fn_type->params[i]
-            : convert_param_type(checker, &node->as.fn_decl.params[i]);
+        TcType *param_type = convert_param_type(checker, &node->as.fn_decl.params[i]);
         add_symbol(checker, param_name ? param_name : "", param_type,
                    node->as.fn_decl.params[i].type != NULL, false);
         free(param_name);
@@ -800,8 +923,9 @@ static void check_stmt(Checker *checker, ASTNode *node) {
                 }
             }
             char *name = copy_token_text(node->as.var_decl.name);
-            add_symbol(checker, name ? name : "", decl_type,
-                       node->as.var_decl.type_annotation != NULL, node->type == NODE_CONST);
+            add_symbol_ns(checker, name ? name : "", decl_type,
+                          node->as.var_decl.type_annotation != NULL,
+                          node->type == NODE_CONST, node->as.var_decl.is_global);
             free(name);
             for (int i = 1; i < node->as.var_decl.name_count; i++) {
                 char *extra = copy_token_text(node->as.var_decl.extra_names[i - 1]);
@@ -809,7 +933,8 @@ static void check_stmt(Checker *checker, ASTNode *node) {
                     ? node->as.var_decl.extra_type_annotations[i - 1]
                     : NULL;
                 TcType *extra_type = extra_ref ? convert_type_ref(checker, extra_ref) : tc_any(checker);
-                add_symbol(checker, extra ? extra : "", extra_type, extra_ref != NULL, node->type == NODE_CONST);
+                add_symbol_ns(checker, extra ? extra : "", extra_type, extra_ref != NULL,
+                              node->type == NODE_CONST, node->as.var_decl.is_global);
                 free(extra);
             }
             break;
@@ -898,8 +1023,19 @@ static void check_stmt(Checker *checker, ASTNode *node) {
         case NODE_DEFER:
             check_expr(checker, node->as.defer_stmt.call);
             break;
-        case NODE_FN_DECL:
-            check_function_body(checker, node);
+        case NODE_FN_DECL: {
+            TcType *fn_type = function_type_from_decl(checker, node);
+            if (!node->as.fn_decl.is_method && node->as.fn_decl.name.length > 0) {
+                char *name = copy_token_text(node->as.fn_decl.name);
+                add_symbol(checker, name ? name : "", fn_type,
+                           node->as.fn_decl.return_type != NULL, true);
+                free(name);
+            }
+            check_function_body_with_type(checker, node, fn_type);
+            break;
+        }
+        case NODE_EXPORT:
+            check_stmt(checker, node->as.export_stmt.declaration);
             break;
         case NODE_BREAK:
         case NODE_CONTINUE:
@@ -917,7 +1053,9 @@ static void register_builtin_fn(Checker *checker, const char *name, TcType *retu
         params = (TcType **)calloc((size_t)arity, sizeof(TcType *));
         for (int i = 0; i < arity; i++) params[i] = tc_any(checker);
     }
-    add_symbol(checker, name, tc_function(checker, params, arity, return_type, variadic), true, true);
+    add_symbol_ns(checker, name,
+                  tc_function(checker, params, arity, return_type, variadic),
+                  true, true, true);
 }
 
 static void register_builtins_for_checker(Checker *checker) {
@@ -939,7 +1077,7 @@ static void register_builtins_for_checker(Checker *checker) {
         "process", "task", "vm", "coroutine"
     };
     for (size_t i = 0; i < sizeof(modules) / sizeof(modules[0]); i++) {
-        add_symbol(checker, modules[i], tc_any(checker), true, true);
+        add_symbol_ns(checker, modules[i], tc_any(checker), true, true, true);
     }
 }
 
@@ -953,6 +1091,10 @@ static void collect_declaration(Checker *checker, ASTNode *node) {
         for (int i = 0; i < node->as.block.stmts.count; i++) {
             collect_declaration(checker, node->as.block.stmts.nodes[i]);
         }
+        return;
+    }
+    if (node->type == NODE_EXPORT) {
+        collect_declaration(checker, node->as.export_stmt.declaration);
         return;
     }
     if (node->type == NODE_TYPE_ALIAS) {
@@ -989,20 +1131,7 @@ static void collect_declaration(Checker *checker, ASTNode *node) {
     }
     if (node->type == NODE_FN_DECL) {
         char *name = copy_token_text(node->as.fn_decl.name);
-        int exposed_param_start = node->as.fn_decl.is_method && node->as.fn_decl.param_count > 0 ? 1 : 0;
-        int exposed_param_count = node->as.fn_decl.param_count - exposed_param_start;
-        if (exposed_param_count < 0) exposed_param_count = 0;
-        TcType **params = NULL;
-        if (exposed_param_count > 0) {
-            params = (TcType **)calloc((size_t)exposed_param_count, sizeof(TcType *));
-            for (int i = 0; i < exposed_param_count; i++) {
-                params[i] = convert_param_type(checker, &node->as.fn_decl.params[i + exposed_param_start]);
-            }
-        }
-        TcType *return_type = node->as.fn_decl.return_type
-            ? convert_type_ref(checker, node->as.fn_decl.return_type)
-            : tc_any(checker);
-        TcType *fn_type = tc_function(checker, params, exposed_param_count, return_type, false);
+        TcType *fn_type = function_type_from_decl(checker, node);
         if (node->as.fn_decl.is_method) {
             char *struct_name = copy_token_text(node->as.fn_decl.method_struct);
             TcAlias *alias = struct_name ? find_alias(checker, struct_name) : NULL;
@@ -1026,13 +1155,14 @@ static void collect_declaration(Checker *checker, ASTNode *node) {
                     params[i] = convert_param_type(checker, &node->as.extern_decl.params[i]);
                 }
             }
-            add_symbol(checker, name ? name : "",
-                       tc_function(checker, params, node->as.extern_decl.param_count,
-                                   convert_type_ref(checker, node->as.extern_decl.type), false),
-                       true, true);
+            add_symbol_ns(checker, name ? name : "",
+                          tc_function(checker, params, node->as.extern_decl.param_count,
+                                      convert_type_ref(checker, node->as.extern_decl.type), false),
+                          true, true, true);
         } else {
-            add_symbol(checker, name ? name : "", convert_type_ref(checker, node->as.extern_decl.type),
-                       true, true);
+            add_symbol_ns(checker, name ? name : "",
+                          convert_type_ref(checker, node->as.extern_decl.type),
+                          true, true, true);
         }
         free(name);
     }

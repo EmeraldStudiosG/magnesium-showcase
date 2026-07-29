@@ -3,8 +3,26 @@
 #include <string.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#define dup _dup
+#define dup2 _dup2
+#define close _close
+#define fileno _fileno
+#define STDERR_FILENO 2
+#else
 #include <unistd.h>
+#endif
 #include "magnesium.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MG_LSP_UNUSED __attribute__((unused))
+#else
+#define MG_LSP_UNUSED
+#endif
 
 #define MAX_OPEN_DOCS 256
 #define MAX_CAPTURE 65536
@@ -42,30 +60,383 @@ static void write_response(const char *json) {
     fflush(stdout);
 }
 
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+    bool failed;
+} JsonBuffer;
+
+static bool json_buffer_init(JsonBuffer *buffer, size_t initial_capacity) {
+    if (!buffer) return false;
+    if (initial_capacity < 256) initial_capacity = 256;
+    buffer->data = malloc(initial_capacity);
+    buffer->length = 0;
+    buffer->capacity = buffer->data ? initial_capacity : 0;
+    buffer->failed = buffer->data == NULL;
+    if (buffer->data) buffer->data[0] = '\0';
+    return !buffer->failed;
+}
+
+static void json_buffer_free(JsonBuffer *buffer) {
+    if (!buffer) return;
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->length = 0;
+    buffer->capacity = 0;
+    buffer->failed = false;
+}
+
+static bool json_buffer_reserve(JsonBuffer *buffer, size_t additional) {
+    if (!buffer || buffer->failed) return false;
+    if (additional > SIZE_MAX - buffer->length - 1) {
+        buffer->failed = true;
+        return false;
+    }
+    size_t required = buffer->length + additional + 1;
+    if (required <= buffer->capacity) return true;
+
+    size_t capacity = buffer->capacity;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2;
+    }
+    char *grown = realloc(buffer->data, capacity);
+    if (!grown) {
+        buffer->failed = true;
+        return false;
+    }
+    buffer->data = grown;
+    buffer->capacity = capacity;
+    return true;
+}
+
+static bool json_buffer_append_bytes(JsonBuffer *buffer, const char *text, size_t length) {
+    if (!text || !json_buffer_reserve(buffer, length)) return false;
+    memcpy(buffer->data + buffer->length, text, length);
+    buffer->length += length;
+    buffer->data[buffer->length] = '\0';
+    return true;
+}
+
+static bool json_buffer_append(JsonBuffer *buffer, const char *text) {
+    return text && json_buffer_append_bytes(buffer, text, strlen(text));
+}
+
+static bool json_buffer_appendf(JsonBuffer *buffer, const char *format, ...) {
+    if (!buffer || buffer->failed || !format) return false;
+
+    while (true) {
+        size_t remaining = buffer->capacity - buffer->length;
+        va_list args;
+        va_start(args, format);
+        int written = vsnprintf(buffer->data + buffer->length, remaining, format, args);
+        va_end(args);
+
+        if (written >= 0 && (size_t)written < remaining) {
+            buffer->length += (size_t)written;
+            return true;
+        }
+
+        size_t needed = written >= 0 ? (size_t)written : remaining;
+        if (needed < 64) needed = 64;
+        if (!json_buffer_reserve(buffer, needed)) return false;
+    }
+}
+
+static bool json_buffer_append_string(JsonBuffer *buffer, const char *text) {
+    if (!json_buffer_append_bytes(buffer, "\"", 1)) return false;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        const char *escape = NULL;
+        switch (*p) {
+            case '"': escape = "\\\""; break;
+            case '\\': escape = "\\\\"; break;
+            case '\b': escape = "\\b"; break;
+            case '\f': escape = "\\f"; break;
+            case '\n': escape = "\\n"; break;
+            case '\r': escape = "\\r"; break;
+            case '\t': escape = "\\t"; break;
+            default: break;
+        }
+        if (escape) {
+            if (!json_buffer_append(buffer, escape)) return false;
+        } else if (*p < 0x20) {
+            if (!json_buffer_appendf(buffer, "\\u%04x", (unsigned int)*p)) return false;
+        } else if (!json_buffer_append_bytes(buffer, (const char *)p, 1)) {
+            return false;
+        }
+    }
+    return json_buffer_append_bytes(buffer, "\"", 1);
+}
+
+static void write_buffer_response(JsonBuffer *buffer, int id) {
+    if (buffer && !buffer->failed && buffer->data) {
+        write_response(buffer->data);
+        return;
+    }
+    char error_response[256];
+    snprintf(error_response, sizeof(error_response),
+             "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32603,"
+             "\"message\":\"Out of memory while building response\"}}", id);
+    write_response(error_response);
+}
+
+static bool append_json(char *buffer, size_t buffer_size, int *offset,
+                        const char *format, ...) {
+    if (!buffer || !offset || *offset < 0 || (size_t)*offset >= buffer_size) return false;
+
+    size_t remaining = buffer_size - (size_t)*offset;
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + *offset, remaining, format, args);
+    va_end(args);
+
+    if (written < 0) return false;
+    if ((size_t)written >= remaining) {
+        *offset = (int)buffer_size - 1;
+        buffer[*offset] = '\0';
+        return false;
+    }
+    *offset += written;
+    return true;
+}
+
+static size_t utf8_sequence_length(const unsigned char *text, size_t remaining,
+                                   uint32_t *codepoint) {
+    unsigned char first = text[0];
+    if (first < 0x80) {
+        *codepoint = first;
+        return 1;
+    }
+
+    size_t length = 0;
+    uint32_t value = 0;
+    if ((first & 0xe0) == 0xc0) {
+        length = 2;
+        value = first & 0x1f;
+    } else if ((first & 0xf0) == 0xe0) {
+        length = 3;
+        value = first & 0x0f;
+    } else if ((first & 0xf8) == 0xf0) {
+        length = 4;
+        value = first & 0x07;
+    } else {
+        *codepoint = 0xfffd;
+        return 1;
+    }
+
+    if (length > remaining) {
+        *codepoint = 0xfffd;
+        return 1;
+    }
+    for (size_t i = 1; i < length; i++) {
+        if ((text[i] & 0xc0) != 0x80) {
+            *codepoint = 0xfffd;
+            return 1;
+        }
+        value = (value << 6) | (text[i] & 0x3f);
+    }
+    if ((length == 2 && value < 0x80) ||
+        (length == 3 && value < 0x800) ||
+        (length == 4 && value < 0x10000) ||
+        value > 0x10ffff ||
+        (value >= 0xd800 && value <= 0xdfff)) {
+        *codepoint = 0xfffd;
+        return 1;
+    }
+    *codepoint = value;
+    return length;
+}
+
+static int utf16_units_for_bytes(const char *text, size_t byte_count) {
+    size_t offset = 0;
+    int units = 0;
+    while (offset < byte_count && text[offset]) {
+        uint32_t codepoint = 0;
+        size_t length = utf8_sequence_length(
+            (const unsigned char *)text + offset, byte_count - offset, &codepoint);
+        units += codepoint > 0xffff ? 2 : 1;
+        offset += length;
+    }
+    return units;
+}
+
+static int byte_offset_from_utf16(const char *text, int utf16_offset) {
+    if (utf16_offset <= 0) return 0;
+
+    size_t byte_length = strlen(text);
+    size_t offset = 0;
+    int units = 0;
+    while (offset < byte_length && units < utf16_offset) {
+        uint32_t codepoint = 0;
+        size_t length = utf8_sequence_length(
+            (const unsigned char *)text + offset, byte_length - offset, &codepoint);
+        int next_units = units + (codepoint > 0xffff ? 2 : 1);
+        if (next_units > utf16_offset) break;
+        units = next_units;
+        offset += length;
+    }
+    return (int)offset;
+}
+
 static char *read_message(void) {
     char line[256];
-    int content_length = -1;
+    size_t content_length = 0;
+    bool found_length = false;
 
     while (fgets(line, sizeof(line), stdin)) {
         if (strncmp(line, "Content-Length:", 15) == 0) {
-            content_length = atoi(line + 15);
+            char *end = NULL;
+            unsigned long long parsed = strtoull(line + 15, &end, 10);
+            if (end != line + 15 && parsed > 0 && parsed <= SIZE_MAX - 1) {
+                content_length = (size_t)parsed;
+                found_length = true;
+            }
         }
         if (line[0] == '\r' || line[0] == '\n') break;
     }
 
-    if (content_length <= 0) return NULL;
+    if (!found_length) return NULL;
 
     char *body = malloc(content_length + 1);
     if (!body) return NULL;
 
-    int total = 0;
+    size_t total = 0;
     while (total < content_length) {
-        int n = fread(body + total, 1, content_length - total, stdin);
-        if (n <= 0) { free(body); return NULL; }
+        size_t n = fread(body + total, 1, content_length - total, stdin);
+        if (n == 0) { free(body); return NULL; }
         total += n;
     }
     body[total] = '\0';
     return body;
+}
+
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool parse_json_hex4(const unsigned char *text,
+                            const unsigned char *end, uint32_t *value) {
+    if (!text || !end || text > end || (size_t)(end - text) < 4) {
+        return false;
+    }
+    uint32_t result = 0;
+    for (int i = 0; i < 4; i++) {
+        int digit = hex_digit_value((char)text[i]);
+        if (digit < 0) return false;
+        result = (result << 4) | (uint32_t)digit;
+    }
+    *value = result;
+    return true;
+}
+
+static bool append_utf8_codepoint(JsonBuffer *buffer, uint32_t codepoint) {
+    char bytes[4];
+    size_t length;
+    if (codepoint <= 0x7f) {
+        bytes[0] = (char)codepoint;
+        length = 1;
+    } else if (codepoint <= 0x7ff) {
+        bytes[0] = (char)(0xc0 | (codepoint >> 6));
+        bytes[1] = (char)(0x80 | (codepoint & 0x3f));
+        length = 2;
+    } else if (codepoint <= 0xffff) {
+        bytes[0] = (char)(0xe0 | (codepoint >> 12));
+        bytes[1] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[2] = (char)(0x80 | (codepoint & 0x3f));
+        length = 3;
+    } else {
+        bytes[0] = (char)(0xf0 | (codepoint >> 18));
+        bytes[1] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
+        bytes[2] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
+        bytes[3] = (char)(0x80 | (codepoint & 0x3f));
+        length = 4;
+    }
+    return json_buffer_append_bytes(buffer, bytes, length);
+}
+
+static char *decode_json_string(const char *text) {
+    JsonBuffer decoded;
+    if (!json_buffer_init(&decoded, 256)) return NULL;
+
+    const unsigned char *p = (const unsigned char *)text;
+    const unsigned char *end = p + strlen(text);
+    while (p < end && *p != '"') {
+        if (*p < 0x20) {
+            json_buffer_free(&decoded);
+            return NULL;
+        }
+        if (*p != '\\') {
+            if (!json_buffer_append_bytes(&decoded, (const char *)p, 1)) break;
+            p++;
+            continue;
+        }
+
+        p++;
+        if (p >= end) {
+            decoded.failed = true;
+            break;
+        }
+        unsigned char escape = *p++;
+        char decoded_char = '\0';
+        switch (escape) {
+            case '"': decoded_char = '"'; break;
+            case '\\': decoded_char = '\\'; break;
+            case '/': decoded_char = '/'; break;
+            case 'b': decoded_char = '\b'; break;
+            case 'f': decoded_char = '\f'; break;
+            case 'n': decoded_char = '\n'; break;
+            case 'r': decoded_char = '\r'; break;
+            case 't': decoded_char = '\t'; break;
+            case 'u': {
+                uint32_t codepoint;
+                if (!parse_json_hex4(p, end, &codepoint)) {
+                    decoded.failed = true;
+                    break;
+                }
+                p += 4;
+                if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                    uint32_t low;
+                    if ((size_t)(end - p) < 6 ||
+                        p[0] != '\\' || p[1] != 'u' ||
+                        !parse_json_hex4(p + 2, end, &low) ||
+                        low < 0xdc00 || low > 0xdfff) {
+                        decoded.failed = true;
+                        break;
+                    }
+                    p += 6;
+                    codepoint = 0x10000 +
+                        ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+                    decoded.failed = true;
+                    break;
+                }
+                if (codepoint == 0 || !append_utf8_codepoint(&decoded, codepoint))
+                    decoded.failed = true;
+                break;
+            }
+            default:
+                decoded.failed = true;
+                break;
+        }
+        if (decoded.failed) break;
+        if (escape != 'u' &&
+            !json_buffer_append_bytes(&decoded, &decoded_char, 1)) {
+            break;
+        }
+    }
+
+    if (p >= end || *p != '"' || decoded.failed) {
+        json_buffer_free(&decoded);
+        return NULL;
+    }
+    return decoded.data;
 }
 
 static char *extract_string(const char *json, const char *key) {
@@ -76,14 +447,7 @@ static char *extract_string(const char *json, const char *key) {
     pos += strlen(search);
     while (*pos && (*pos == ' ' || *pos == ':' || *pos == '\t')) pos++;
     if (*pos != '"') return NULL;
-    pos++;
-    const char *end = strchr(pos, '"');
-    if (!end) return NULL;
-    size_t len = end - pos;
-    char *result = malloc(len + 1);
-    memcpy(result, pos, len);
-    result[len] = '\0';
-    return result;
+    return decode_json_string(pos + 1);
 }
 
 static int extract_int(const char *json, const char *key) {
@@ -109,64 +473,7 @@ static char *extract_text(const char *json) {
     pos += 6;
     while (*pos && (*pos != '"')) pos++;
     if (*pos != '"') return NULL;
-    pos++;
-
-    const char *scan = pos;
-    size_t max_len = 0;
-    int esc = 0;
-    while (*scan) {
-        if (!esc && *scan == '\\') { esc = 1; scan++; continue; }
-        if (!esc && *scan == '"') break;
-        esc = 0;
-        scan++;
-        max_len++;
-    }
-
-    char *result = malloc(max_len + 4);
-    if (!result) return NULL;
-    char *dst = result;
-    esc = 0;
-    while (*pos) {
-        if (!esc && *pos == '\\') { esc = 1; pos++; continue; }
-        if (!esc && *pos == '"') break;
-        if (esc) {
-            switch (*pos) {
-                case 'n':  *dst++ = '\n'; break;
-                case 'r':  *dst++ = '\r'; break;
-                case 't':  *dst++ = '\t'; break;
-                case '"':  *dst++ = '"';  break;
-                case '\\': *dst++ = '\\'; break;
-                case '/':  *dst++ = '/';  break;
-                case 'b':  *dst++ = '\b'; break;
-                case 'f':  *dst++ = '\f'; break;
-                case 'u': {
-                    if (pos[1] && pos[2] && pos[3] && pos[4]) {
-                        char hex[5] = { pos[1], pos[2], pos[3], pos[4], 0 };
-                        unsigned cp = (unsigned)strtoul(hex, NULL, 16);
-                        if (cp < 0x80) {
-                            *dst++ = (char)cp;
-                        } else if (cp < 0x800) {
-                            *dst++ = (char)(0xC0 | (cp >> 6));
-                            *dst++ = (char)(0x80 | (cp & 0x3F));
-                        } else {
-                            *dst++ = (char)(0xE0 | (cp >> 12));
-                            *dst++ = (char)(0x80 | ((cp >> 6) & 0x3F));
-                            *dst++ = (char)(0x80 | (cp & 0x3F));
-                        }
-                        pos += 4;
-                    }
-                    break;
-                }
-                default: *dst++ = *pos; break;
-            }
-            esc = 0;
-            pos++;
-        } else {
-            *dst++ = *pos++;
-        }
-    }
-    *dst = '\0';
-    return result;
+    return decode_json_string(pos + 1);
 }
 
 static void json_escape(const char *src, char *dst, size_t dst_size) {
@@ -195,16 +502,19 @@ static void append_lsp_diagnostic(char *json, size_t json_size, int *offset, boo
     char escaped[1024];
     json_escape(message, escaped, sizeof(escaped));
 
-    if (!*first) {
-        *offset += snprintf(json + *offset, json_size - (size_t)*offset, ",");
-    }
-    *first = false;
+    int original_offset = *offset;
+    if (!*first && !append_json(json, json_size, offset, ",")) return;
 
-    *offset += snprintf(json + *offset, json_size - (size_t)*offset,
+    if (!append_json(json, json_size, offset,
         "{\"range\":{\"start\":{\"line\":%d,\"character\":%d},"
         "\"end\":{\"line\":%d,\"character\":%d}},"
         "\"severity\":%d,\"message\":\"%s\",\"source\":\"magnesium\"}",
-        line, start_char, line, end_char, severity, escaped);
+        line, start_char, line, end_char, severity, escaped)) {
+        *offset = original_offset;
+        json[*offset] = '\0';
+        return;
+    }
+    *first = false;
 }
 
 static bool is_ident_start_char(char c) {
@@ -383,8 +693,9 @@ static bool find_numeric_comparison(const char *line, const char *name,
     return false;
 }
 
-static void __attribute__((unused)) append_semantic_diagnostics(OpenDoc *doc, char *json, size_t json_size,
-                                                               int *offset, bool *first) {
+static void MG_LSP_UNUSED append_semantic_diagnostics(OpenDoc *doc, char *json,
+                                                       size_t json_size,
+                                                       int *offset, bool *first) {
     LspKnown known[256];
     int known_count = 0;
     const char *line_start = doc->text;
@@ -748,9 +1059,8 @@ static bool word_at_position(OpenDoc *doc, int line, int character,
     if (!copy_doc_line(doc, line, text_line, sizeof(text_line))) return false;
     int len = (int)strlen(text_line);
     if (character < 0) character = 0;
-    if (character > len) character = len;
 
-    int pos = character;
+    int pos = byte_offset_from_utf16(text_line, character);
     if (pos == len && pos > 0) pos--;
     if (pos < len && !is_ident_char(text_line[pos]) && pos > 0 && is_ident_char(text_line[pos - 1])) pos--;
     if (pos >= len || !is_ident_char(text_line[pos])) return false;
@@ -764,8 +1074,8 @@ static bool word_at_position(OpenDoc *doc, int line, int character,
     if (word_len == 0 || word_len >= word_size) return false;
     memcpy(word, text_line + start, word_len);
     word[word_len] = '\0';
-    if (start_char) *start_char = start;
-    if (end_char) *end_char = end;
+    if (start_char) *start_char = utf16_units_for_bytes(text_line, (size_t)start);
+    if (end_char) *end_char = utf16_units_for_bytes(text_line, (size_t)end);
     return true;
 }
 
@@ -775,6 +1085,7 @@ static bool module_context_at(OpenDoc *doc, int line, int character,
     if (!copy_doc_line(doc, line, text_line, sizeof(text_line))) return false;
     int len = (int)strlen(text_line);
     if (character < 0) character = 0;
+    character = byte_offset_from_utf16(text_line, character);
     if (character > len) character = len;
 
     int i = character - 1;
@@ -920,48 +1231,48 @@ static const LspItem *find_known_item(const char *name) {
     return NULL;
 }
 
-static void append_completion_item(char *json, size_t json_size, int *offset, bool *first,
-                                   const LspItem *item) {
-    if (!*first) *offset += snprintf(json + *offset, json_size - (size_t)*offset, ",");
+static void append_completion_item(JsonBuffer *json, bool *first, const LspItem *item) {
+    if (!*first && !json_buffer_append(json, ",")) return;
+    if (!json_buffer_append(json, "{\"label\":") ||
+        !json_buffer_append_string(json, item->label) ||
+        !json_buffer_appendf(json, ",\"kind\":%d,\"detail\":", item->kind) ||
+        !json_buffer_append_string(json, item->detail ? item->detail : "") ||
+        !json_buffer_append(json, ",\"documentation\":{\"kind\":\"markdown\",\"value\":") ||
+        !json_buffer_append_string(json, item->doc ? item->doc : "") ||
+        !json_buffer_append(json, "}}")) {
+        return;
+    }
     *first = false;
-    char label[256], detail[512], doc[1024];
-    json_escape(item->label, label, sizeof(label));
-    json_escape(item->detail ? item->detail : "", detail, sizeof(detail));
-    json_escape(item->doc ? item->doc : "", doc, sizeof(doc));
-    *offset += snprintf(json + *offset, json_size - (size_t)*offset,
-        "{\"label\":\"%s\",\"kind\":%d,\"detail\":\"%s\","
-        "\"documentation\":{\"kind\":\"markdown\",\"value\":\"%s\"}}",
-        label, item->kind, detail, doc);
 }
 
-static void append_completion_symbol(char *json, size_t json_size, int *offset, bool *first,
+static void append_completion_symbol(JsonBuffer *json, bool *first,
                                      const char *name, int kind) {
     LspItem item = {name, kind == 12 ? 3 : (kind == 23 ? 22 : kind == 10 ? 13 : 6),
                     "document symbol", "Declared in this document."};
-    append_completion_item(json, json_size, offset, first, &item);
+    append_completion_item(json, first, &item);
 }
 
-static void append_doc_symbol_completions(OpenDoc *doc, char *json, size_t json_size,
-                                          int *offset, bool *first) {
+static void append_doc_symbol_completions(OpenDoc *doc, JsonBuffer *json, bool *first) {
     const char *line_start = doc->text;
-    int line_no = 0;
     while (line_start && *line_start) {
         const char *line_end = strchr(line_start, '\n');
         size_t len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-        char line[2048];
-        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        char *line = malloc(len + 1);
+        if (!line) {
+            json->failed = true;
+            return;
+        }
         memcpy(line, line_start, len);
         line[len] = '\0';
         char name[128];
         int start = 0;
         int kind = 13;
         if (parse_symbol_line(line, name, sizeof(name), &start, &kind)) {
-            append_completion_symbol(json, json_size, offset, first, name, kind);
+            append_completion_symbol(json, first, name, kind);
         }
-        (void)line_no;
+        free(line);
         if (!line_end) break;
         line_start = line_end + 1;
-        line_no++;
     }
 }
 
@@ -1003,14 +1314,14 @@ static bool find_doc_symbol_detail(OpenDoc *doc, const char *needle,
 
 static void handle_completion(const char *json, int id) {
     OpenDoc *doc = request_doc(json);
-    char response[MAX_CAPTURE];
-    int offset = 0;
+    JsonBuffer response;
+    json_buffer_init(&response, MAX_CAPTURE);
     bool first = true;
     int line = extract_int(json, "line");
     int character = extract_int(json, "character");
     char module[64];
 
-    offset += snprintf(response + offset, sizeof(response) - offset,
+    json_buffer_appendf(&response,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"isIncomplete\":false,\"items\":[", id);
 
     if (doc && module_context_at(doc, line, character, module, sizeof(module))) {
@@ -1018,24 +1329,25 @@ static void handle_completion(const char *json, int id) {
         int count = 0;
         if (module_items(module, &items, &count)) {
             for (int i = 0; i < count; i++) {
-                append_completion_item(response, sizeof(response), &offset, &first, &items[i]);
+                append_completion_item(&response, &first, &items[i]);
             }
         }
     } else {
         for (size_t i = 0; i < sizeof(keyword_items) / sizeof(keyword_items[0]); i++) {
-            append_completion_item(response, sizeof(response), &offset, &first, &keyword_items[i]);
+            append_completion_item(&response, &first, &keyword_items[i]);
         }
         for (size_t i = 0; i < sizeof(builtin_items) / sizeof(builtin_items[0]); i++) {
-            append_completion_item(response, sizeof(response), &offset, &first, &builtin_items[i]);
+            append_completion_item(&response, &first, &builtin_items[i]);
         }
         for (size_t i = 0; i < sizeof(type_items) / sizeof(type_items[0]); i++) {
-            append_completion_item(response, sizeof(response), &offset, &first, &type_items[i]);
+            append_completion_item(&response, &first, &type_items[i]);
         }
-        if (doc) append_doc_symbol_completions(doc, response, sizeof(response), &offset, &first);
+        if (doc) append_doc_symbol_completions(doc, &response, &first);
     }
 
-    offset += snprintf(response + offset, sizeof(response) - offset, "]}}");
-    write_response(response);
+    json_buffer_append(&response, "]}}");
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
 }
 
 static void handle_hover(const char *json, int id) {
@@ -1045,11 +1357,13 @@ static void handle_hover(const char *json, int id) {
     char word[128];
     char qualified[256];
     int start = 0, end = 0;
-    char response[4096];
+    JsonBuffer response;
+    json_buffer_init(&response, 4096);
 
     if (!doc || !word_at_position(doc, line, character, word, sizeof(word), &start, &end)) {
-        snprintf(response, sizeof(response), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
-        write_response(response);
+        json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
         return;
     }
 
@@ -1066,42 +1380,60 @@ static void handle_hover(const char *json, int id) {
         int def_line = 0, def_start = 0, def_end = 0;
         if (find_doc_symbol_detail(doc, word, detail_line, sizeof(detail_line),
                                    &def_line, &def_start, &def_end)) {
-            char escaped_detail[2048];
-            json_escape(detail_line, escaped_detail, sizeof(escaped_detail));
-            snprintf(response, sizeof(response),
+            json_buffer_appendf(&response,
                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"contents\":{\"kind\":\"markdown\","
-                "\"value\":\"`%s`\\n\\nDeclared in this document.\"},\"range\":{\"start\":{\"line\":%d,"
+                "\"value\":", id);
+            JsonBuffer hover_text;
+            json_buffer_init(&hover_text, strlen(detail_line) + 64);
+            json_buffer_append(&hover_text, "`");
+            json_buffer_append(&hover_text, detail_line);
+            json_buffer_append(&hover_text, "`\n\nDeclared in this document.");
+            if (!hover_text.failed) json_buffer_append_string(&response, hover_text.data);
+            else response.failed = true;
+            json_buffer_free(&hover_text);
+            json_buffer_appendf(&response,
+                "},\"range\":{\"start\":{\"line\":%d,"
                 "\"character\":%d},\"end\":{\"line\":%d,\"character\":%d}}}}",
-                id, escaped_detail, line, start, line, end);
-            write_response(response);
+                line, start, line, end);
+            write_buffer_response(&response, id);
+            json_buffer_free(&response);
             (void)def_line;
             (void)def_start;
             (void)def_end;
             return;
         }
-        snprintf(response, sizeof(response), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
-        write_response(response);
+        json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
         return;
     }
 
-    char detail[512], doc_text[1024];
-    json_escape(item->detail ? item->detail : item->label, detail, sizeof(detail));
-    json_escape(item->doc ? item->doc : "", doc_text, sizeof(doc_text));
-    snprintf(response, sizeof(response),
+    JsonBuffer hover_text;
+    json_buffer_init(&hover_text, 1024);
+    json_buffer_append(&hover_text, "`");
+    json_buffer_append(&hover_text, item->detail ? item->detail : item->label);
+    json_buffer_append(&hover_text, "`\n\n");
+    json_buffer_append(&hover_text, item->doc ? item->doc : "");
+    json_buffer_appendf(&response,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"contents\":{\"kind\":\"markdown\","
-        "\"value\":\"`%s`\\n\\n%s\"},\"range\":{\"start\":{\"line\":%d,\"character\":%d},"
+        "\"value\":", id);
+    if (!hover_text.failed) json_buffer_append_string(&response, hover_text.data);
+    else response.failed = true;
+    json_buffer_free(&hover_text);
+    json_buffer_appendf(&response,
+        "},\"range\":{\"start\":{\"line\":%d,\"character\":%d},"
         "\"end\":{\"line\":%d,\"character\":%d}}}}",
-        id, detail, doc_text, line, start, line, end);
-    write_response(response);
+        line, start, line, end);
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
 }
 
 static void handle_document_symbols(const char *json, int id) {
     OpenDoc *doc = request_doc(json);
-    char response[MAX_CAPTURE];
-    int offset = 0;
+    JsonBuffer response;
+    json_buffer_init(&response, MAX_CAPTURE);
     bool first = true;
-    offset += snprintf(response + offset, sizeof(response) - offset,
-        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":[", id);
+    json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":[", id);
 
     if (doc && doc->text) {
         const char *line_start = doc->text;
@@ -1109,8 +1441,11 @@ static void handle_document_symbols(const char *json, int id) {
         while (*line_start) {
             const char *line_end = strchr(line_start, '\n');
             size_t len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-            char line[2048];
-            if (len >= sizeof(line)) len = sizeof(line) - 1;
+            char *line = malloc(len + 1);
+            if (!line) {
+                response.failed = true;
+                break;
+            }
             memcpy(line, line_start, len);
             line[len] = '\0';
 
@@ -1118,26 +1453,31 @@ static void handle_document_symbols(const char *json, int id) {
             int start = 0;
             int kind = 13;
             if (parse_symbol_line(line, name, sizeof(name), &start, &kind)) {
-                if (!first) offset += snprintf(response + offset, sizeof(response) - offset, ",");
-                first = false;
-                char escaped[256];
-                json_escape(name, escaped, sizeof(escaped));
-                offset += snprintf(response + offset, sizeof(response) - offset,
-                    "{\"name\":\"%s\",\"kind\":%d,\"range\":{\"start\":{\"line\":%d,\"character\":0},"
-                    "\"end\":{\"line\":%d,\"character\":%zu}},\"selectionRange\":{\"start\":{\"line\":%d,"
+                int line_utf16 = utf16_units_for_bytes(line, strlen(line));
+                int start_utf16 = utf16_units_for_bytes(line, (size_t)start);
+                int end_utf16 = utf16_units_for_bytes(line, (size_t)start + strlen(name));
+                if (!first) json_buffer_append(&response, ",");
+                json_buffer_append(&response, "{\"name\":");
+                json_buffer_append_string(&response, name);
+                json_buffer_appendf(&response,
+                    ",\"kind\":%d,\"range\":{\"start\":{\"line\":%d,\"character\":0},"
+                    "\"end\":{\"line\":%d,\"character\":%d}},\"selectionRange\":{\"start\":{\"line\":%d,"
                     "\"character\":%d},\"end\":{\"line\":%d,\"character\":%d}}}",
-                    escaped, kind, line_no, line_no, strlen(line), line_no, start, line_no,
-                    start + (int)strlen(name));
+                    kind, line_no, line_no, line_utf16, line_no, start_utf16, line_no,
+                    end_utf16);
+                first = false;
             }
 
+            free(line);
             if (!line_end) break;
             line_start = line_end + 1;
             line_no++;
         }
     }
 
-    offset += snprintf(response + offset, sizeof(response) - offset, "]}");
-    write_response(response);
+    json_buffer_append(&response, "]}");
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
 }
 
 static bool find_definition(OpenDoc *doc, const char *needle, int *line_out,
@@ -1159,8 +1499,8 @@ static bool find_definition(OpenDoc *doc, const char *needle, int *line_out,
         if (parse_symbol_line(line, name, sizeof(name), &start, &kind) &&
             strcmp(name, needle) == 0) {
             *line_out = line_no;
-            *start_out = start;
-            *end_out = start + (int)strlen(name);
+            *start_out = utf16_units_for_bytes(line, (size_t)start);
+            *end_out = utf16_units_for_bytes(line, (size_t)start + strlen(name));
             return true;
         }
         (void)kind;
@@ -1176,7 +1516,8 @@ static void handle_definition(const char *json, int id) {
     int line = extract_int(json, "line");
     int character = extract_int(json, "character");
     char word[128];
-    char response[4096];
+    JsonBuffer response;
+    json_buffer_init(&response, 4096);
     int start = 0, end = 0;
     int def_line = 0, def_start = 0, def_end = 0;
 
@@ -1184,19 +1525,22 @@ static void handle_definition(const char *json, int id) {
     if (!doc || !uri ||
         !word_at_position(doc, line, character, word, sizeof(word), &start, &end) ||
         !find_definition(doc, word, &def_line, &def_start, &def_end)) {
-        snprintf(response, sizeof(response), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
-        write_response(response);
+        json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
         free(uri);
         return;
     }
 
-    char escaped_uri[1400];
-    json_escape(uri, escaped_uri, sizeof(escaped_uri));
-    snprintf(response, sizeof(response),
-        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"uri\":\"%s\",\"range\":{\"start\":{\"line\":%d,"
+    json_buffer_appendf(&response,
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"uri\":", id);
+    json_buffer_append_string(&response, uri);
+    json_buffer_appendf(&response,
+        ",\"range\":{\"start\":{\"line\":%d,"
         "\"character\":%d},\"end\":{\"line\":%d,\"character\":%d}}}}",
-        id, escaped_uri, def_line, def_start, def_line, def_end);
-    write_response(response);
+        def_line, def_start, def_line, def_end);
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
     free(uri);
 }
 
@@ -1226,6 +1570,7 @@ static bool call_name_at(OpenDoc *doc, int line, int character, char *name, size
     char text_line[2048];
     if (!copy_doc_line(doc, line, text_line, sizeof(text_line))) return false;
     int len = (int)strlen(text_line);
+    character = byte_offset_from_utf16(text_line, character);
     if (character > len) character = len;
     int paren = -1;
     int depth = 0;
@@ -1285,31 +1630,34 @@ static void handle_signature_help(const char *json, int id) {
     int line = extract_int(json, "line");
     int character = extract_int(json, "character");
     char name[160];
-    char response[4096];
+    JsonBuffer response;
+    json_buffer_init(&response, 4096);
     const char *sig = NULL;
+    name[0] = '\0';
 
     if (doc && call_name_at(doc, line, character, name, sizeof(name))) {
         sig = signature_for_name(name);
     }
     char doc_sig[2048];
-    if (!sig && doc && find_doc_signature(doc, name, doc_sig, sizeof(doc_sig))) {
+    if (!sig && name[0] && doc && find_doc_signature(doc, name, doc_sig, sizeof(doc_sig))) {
         sig = doc_sig;
     }
     if (!sig) {
-        snprintf(response, sizeof(response),
+        json_buffer_appendf(&response,
             "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}}",
             id);
-        write_response(response);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
         return;
     }
 
-    char escaped[512];
-    json_escape(sig, escaped, sizeof(escaped));
-    snprintf(response, sizeof(response),
-        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"signatures\":[{\"label\":\"%s\"}],"
-        "\"activeSignature\":0,\"activeParameter\":0}}",
-        id, escaped);
-    write_response(response);
+    json_buffer_appendf(&response,
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"signatures\":[{\"label\":", id);
+    json_buffer_append_string(&response, sig);
+    json_buffer_append(&response, "}],"
+        "\"activeSignature\":0,\"activeParameter\":0}}");
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
 }
 
 static void handle_rename(const char *json, int id) {
@@ -1319,56 +1667,64 @@ static void handle_rename(const char *json, int id) {
     char *new_name = extract_string(json, "newName");
     char *uri = extract_string(json, "uri");
     char old_name[128];
-    char response[MAX_CAPTURE * 2];
-    int offset = 0;
+    JsonBuffer response;
+    json_buffer_init(&response, MAX_CAPTURE);
     bool first = true;
     int start = 0, end = 0;
 
     if (!doc || !uri || !new_name || !word_at_position(doc, line, character, old_name, sizeof(old_name), &start, &end)) {
-        snprintf(response, sizeof(response), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
-        write_response(response);
+        json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":null}", id);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
         free(new_name);
         free(uri);
         return;
     }
 
-    char escaped_uri[1400];
-    char escaped_new[256];
-    json_escape(uri, escaped_uri, sizeof(escaped_uri));
-    json_escape(new_name, escaped_new, sizeof(escaped_new));
-    offset += snprintf(response + offset, sizeof(response) - offset,
-        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"changes\":{\"%s\":[", id, escaped_uri);
+    json_buffer_appendf(&response,
+        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"changes\":{", id);
+    json_buffer_append_string(&response, uri);
+    json_buffer_append(&response, ":[");
 
     const char *line_start = doc->text;
     int line_no = 0;
     while (*line_start) {
         const char *line_end = strchr(line_start, '\n');
         size_t len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-        char line_buf[2048];
-        if (len >= sizeof(line_buf)) len = sizeof(line_buf) - 1;
+        char *line_buf = malloc(len + 1);
+        if (!line_buf) {
+            response.failed = true;
+            break;
+        }
         memcpy(line_buf, line_start, len);
         line_buf[len] = '\0';
 
         const char *p = line_buf;
         while ((p = find_identifier_use(p, old_name)) != NULL) {
-            int s = (int)(p - line_buf);
-            int e = s + (int)strlen(old_name);
-            if (!first) offset += snprintf(response + offset, sizeof(response) - offset, ",");
+            int byte_start = (int)(p - line_buf);
+            int byte_end = byte_start + (int)strlen(old_name);
+            int s = utf16_units_for_bytes(line_buf, (size_t)byte_start);
+            int e = utf16_units_for_bytes(line_buf, (size_t)byte_end);
+            if (!first) json_buffer_append(&response, ",");
             first = false;
-            offset += snprintf(response + offset, sizeof(response) - offset,
+            json_buffer_appendf(&response,
                 "{\"range\":{\"start\":{\"line\":%d,\"character\":%d},\"end\":{\"line\":%d,"
-                "\"character\":%d}},\"newText\":\"%s\"}",
-                line_no, s, line_no, e, escaped_new);
+                "\"character\":%d}},\"newText\":",
+                line_no, s, line_no, e);
+            json_buffer_append_string(&response, new_name);
+            json_buffer_append(&response, "}");
             p += strlen(old_name);
         }
 
+        free(line_buf);
         if (!line_end) break;
         line_start = line_end + 1;
         line_no++;
     }
 
-    offset += snprintf(response + offset, sizeof(response) - offset, "]}}}");
-    write_response(response);
+    json_buffer_append(&response, "]}}}");
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
     free(new_name);
     free(uri);
 }
@@ -1403,39 +1759,41 @@ static bool line_reopens_after(const char *trimmed) {
 
 static void handle_formatting(const char *json, int id) {
     OpenDoc *doc = request_doc(json);
-    char formatted[MAX_CAPTURE];
-    char escaped[MAX_CAPTURE];
-    char response[MAX_CAPTURE * 2];
-    int out = 0;
+    JsonBuffer formatted;
+    JsonBuffer response;
+    json_buffer_init(&formatted, doc && doc->text ? strlen(doc->text) + 256 : 256);
+    json_buffer_init(&response, doc && doc->text ? strlen(doc->text) + 512 : 512);
     int indent = 0;
 
     if (!doc || !doc->text) {
-        snprintf(response, sizeof(response), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":[]}", id);
-        write_response(response);
+        json_buffer_appendf(&response, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":[]}", id);
+        write_buffer_response(&response, id);
+        json_buffer_free(&response);
+        json_buffer_free(&formatted);
         return;
     }
 
     const char *line_start = doc->text;
-    while (*line_start && out < (int)sizeof(formatted) - 1) {
+    while (*line_start && !formatted.failed) {
         const char *line_end = strchr(line_start, '\n');
         size_t len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-        char line[2048];
-        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        char *line = malloc(len + 1);
+        if (!line) {
+            formatted.failed = true;
+            break;
+        }
         memcpy(line, line_start, len);
         line[len] = '\0';
         char *trimmed = trim_line(line);
 
         if (line_closes_before(trimmed) && indent > 0) indent--;
         if (trimmed[0] != '\0') {
-            for (int i = 0; i < indent && out < (int)sizeof(formatted) - 5; i++) {
-                formatted[out++] = ' ';
-                formatted[out++] = ' ';
-                formatted[out++] = ' ';
-                formatted[out++] = ' ';
+            for (int i = 0; i < indent; i++) {
+                if (!json_buffer_append(&formatted, "    ")) break;
             }
-            out += snprintf(formatted + out, sizeof(formatted) - (size_t)out, "%s", trimmed);
+            json_buffer_append(&formatted, trimmed);
         }
-        formatted[out++] = '\n';
+        json_buffer_append(&formatted, "\n");
         if (line_reopens_after(trimmed)) {
             indent++;
         } else if (line_opens_block(trimmed) &&
@@ -1444,18 +1802,23 @@ static void handle_formatting(const char *json, int id) {
                    !(strncmp(trimmed, "catch", 5) == 0 && !is_ident_char(trimmed[5]))) {
             indent++;
         }
+        free(line);
 
         if (!line_end) break;
         line_start = line_end + 1;
     }
-    formatted[out] = '\0';
-    json_escape(formatted, escaped, sizeof(escaped));
+
     int line_count = count_doc_lines(doc);
-    snprintf(response, sizeof(response),
+    json_buffer_appendf(&response,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},"
-        "\"end\":{\"line\":%d,\"character\":0}},\"newText\":\"%s\"}]}",
-        id, line_count, escaped);
-    write_response(response);
+        "\"end\":{\"line\":%d,\"character\":0}},\"newText\":",
+        id, line_count);
+    if (!formatted.failed) json_buffer_append_string(&response, formatted.data);
+    else response.failed = true;
+    json_buffer_append(&response, "}]}");
+    write_buffer_response(&response, id);
+    json_buffer_free(&response);
+    json_buffer_free(&formatted);
 }
 
 static int semantic_type_for_token(const char *token) {
@@ -1478,46 +1841,69 @@ static int semantic_type_for_token(const char *token) {
     return 1;
 }
 
-static void append_semantic_token(char *json, size_t json_size, int *offset,
+static bool append_semantic_token(char *json, size_t json_size, int *offset,
                                   int *last_line, int *last_start,
                                   int line, int start, int length, int token_type) {
-    if (length <= 0) return;
+    if (length <= 0) return true;
     int delta_line = line - *last_line;
     int delta_start = delta_line == 0 ? start - *last_start : start;
+    int original_offset = *offset;
     if (*offset > 0 && json[*offset - 1] != '[') {
-        *offset += snprintf(json + *offset, json_size - (size_t)*offset, ",");
+        if (!append_json(json, json_size, offset, ",")) return false;
     }
-    *offset += snprintf(json + *offset, json_size - (size_t)*offset,
-                        "%d,%d,%d,%d,0", delta_line, delta_start, length, token_type);
+    if (!append_json(json, json_size, offset, "%d,%d,%d,%d,0",
+                     delta_line, delta_start, length, token_type)) {
+        *offset = original_offset;
+        json[*offset] = '\0';
+        return false;
+    }
     *last_line = line;
     *last_start = start;
+    return true;
 }
 
 static void handle_semantic_tokens(const char *json, int id) {
     OpenDoc *doc = request_doc(json);
-    char response[MAX_CAPTURE];
+    size_t source_length = doc && doc->text ? strlen(doc->text) : 0;
+    if (source_length > (SIZE_MAX - 1024) / 24) source_length = (SIZE_MAX - 1024) / 24;
+    size_t response_size = source_length * 24 + 1024;
+    if (response_size < MAX_CAPTURE) response_size = MAX_CAPTURE;
+    char *response = malloc(response_size);
+    if (!response) {
+        char error_response[256];
+        snprintf(error_response, sizeof(error_response),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32603,"
+                 "\"message\":\"Out of memory\"}}", id);
+        write_response(error_response);
+        return;
+    }
     int offset = 0;
     int last_line = 0;
     int last_start = 0;
-    offset += snprintf(response + offset, sizeof(response) - offset,
+    bool full = !append_json(response, response_size, &offset,
         "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"data\":[", id);
 
-    if (doc && doc->text) {
+    if (!full && doc && doc->text) {
         const char *line_start = doc->text;
         int line_no = 0;
-        while (*line_start) {
+        while (*line_start && !full) {
             const char *line_end = strchr(line_start, '\n');
             size_t len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-            char line[2048];
-            if (len >= sizeof(line)) len = sizeof(line) - 1;
+            char *line = malloc(len + 1);
+            if (!line) {
+                full = true;
+                break;
+            }
             memcpy(line, line_start, len);
             line[len] = '\0';
 
             for (int i = 0; line[i];) {
                 if (line[i] == '/' && line[i + 1] == '/') {
-                    append_semantic_token(response, sizeof(response), &offset,
-                                          &last_line, &last_start,
-                                          line_no, i, (int)strlen(line + i), 10);
+                    int start_utf16 = utf16_units_for_bytes(line, (size_t)i);
+                    int length_utf16 = utf16_units_for_bytes(line + i, strlen(line + i));
+                    full = !append_semantic_token(response, response_size, &offset,
+                                                  &last_line, &last_start, line_no,
+                                                  start_utf16, length_utf16, 10);
                     break;
                 }
                 if (line[i] == '"') {
@@ -1527,17 +1913,23 @@ static void handle_semantic_tokens(const char *json, int id) {
                         else i++;
                     }
                     if (line[i] == '"') i++;
-                    append_semantic_token(response, sizeof(response), &offset,
-                                          &last_line, &last_start,
-                                          line_no, start, i - start, 7);
+                    int start_utf16 = utf16_units_for_bytes(line, (size_t)start);
+                    int length_utf16 = utf16_units_for_bytes(
+                        line + start, (size_t)(i - start));
+                    full = !append_semantic_token(response, response_size, &offset,
+                                                  &last_line, &last_start, line_no,
+                                                  start_utf16, length_utf16, 7);
+                    if (full) break;
                     continue;
                 }
                 if (isdigit((unsigned char)line[i])) {
                     int start = i++;
                     while (isdigit((unsigned char)line[i]) || line[i] == '.') i++;
-                    append_semantic_token(response, sizeof(response), &offset,
-                                          &last_line, &last_start,
-                                          line_no, start, i - start, 8);
+                    int start_utf16 = utf16_units_for_bytes(line, (size_t)start);
+                    full = !append_semantic_token(response, response_size, &offset,
+                                                  &last_line, &last_start, line_no,
+                                                  start_utf16, i - start, 8);
+                    if (full) break;
                     continue;
                 }
                 if (is_ident_start_char(line[i]) || line[i] == '@') {
@@ -1554,47 +1946,61 @@ static void handle_semantic_tokens(const char *json, int id) {
                     if (token_len > 0 && token_len < (int)sizeof(token)) {
                         memcpy(token, line + token_start, (size_t)token_len);
                         token[token_len] = '\0';
-                        append_semantic_token(response, sizeof(response), &offset,
-                                              &last_line, &last_start,
-                                              line_no, start, i - start,
-                                              semantic_type_for_token(token));
+                        int start_utf16 = utf16_units_for_bytes(line, (size_t)start);
+                        full = !append_semantic_token(
+                            response, response_size, &offset, &last_line, &last_start,
+                            line_no, start_utf16, i - start,
+                            semantic_type_for_token(token));
+                        if (full) break;
                     }
                     continue;
                 }
                 if (strchr("+-*/%=<>!&|?.", line[i])) {
-                    append_semantic_token(response, sizeof(response), &offset,
-                                          &last_line, &last_start,
-                                          line_no, i, 1, 11);
+                    int start_utf16 = utf16_units_for_bytes(line, (size_t)i);
+                    full = !append_semantic_token(response, response_size, &offset,
+                                                  &last_line, &last_start, line_no,
+                                                  start_utf16, 1, 11);
+                    if (full) break;
                 }
                 i++;
             }
 
-            if (!line_end) break;
+            free(line);
+            if (!line_end || full) break;
             line_start = line_end + 1;
             line_no++;
         }
     }
 
-    offset += snprintf(response + offset, sizeof(response) - offset, "]}}");
+    if (!append_json(response, response_size, &offset, "]}}")) {
+        response[0] = '\0';
+        offset = 0;
+        append_json(response, response_size, &offset,
+                    "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32603,"
+                    "\"message\":\"Semantic token response too large\"}}", id);
+    }
     write_response(response);
+    free(response);
 }
 
 static void publish_diagnostics(OpenDoc *doc) {
     if (!doc->text) return;
 
-    char tmp_err_file[] = "/tmp/mg-lsp-err-XXXXXX";
-    int fd = mkstemp(tmp_err_file);
-    if (fd == -1) return;
-
+    FILE *error_stream = tmpfile();
+    if (!error_stream) return;
+    int fd = fileno(error_stream);
     int old_stderr = dup(STDERR_FILENO);
-    dup2(fd, STDERR_FILENO);
-    close(fd);
+    if (fd == -1 || old_stderr == -1 || dup2(fd, STDERR_FILENO) == -1) {
+        if (old_stderr != -1) close(old_stderr);
+        fclose(error_stream);
+        return;
+    }
 
     VM *vm = calloc(1, sizeof(VM));
     if (!vm) {
         dup2(old_stderr, STDERR_FILENO);
         close(old_stderr);
-        unlink(tmp_err_file);
+        fclose(error_stream);
         return;
     }
     vm_init(vm);
@@ -1604,23 +2010,22 @@ static void publish_diagnostics(OpenDoc *doc) {
     dup2(old_stderr, STDERR_FILENO);
     close(old_stderr);
 
-    FILE *ef = fopen(tmp_err_file, "r");
+    rewind(error_stream);
     size_t n = 0;
-    if (ef) {
-        n = fread(compiler_err_buf, 1, sizeof(compiler_err_buf) - 1, ef);
-        fclose(ef);
-    }
+    n = fread(compiler_err_buf, 1, sizeof(compiler_err_buf) - 1, error_stream);
+    fclose(error_stream);
     compiler_err_buf[n] = '\0';
-    unlink(tmp_err_file);
 
     char *err_output = compiler_err_buf;
     char diag_json[MAX_CAPTURE];
     int offset = 0;
     bool first = true;
 
-    offset += snprintf(diag_json + offset, sizeof(diag_json) - offset,
+    char escaped_uri[2048];
+    json_escape(doc->uri, escaped_uri, sizeof(escaped_uri));
+    append_json(diag_json, sizeof(diag_json), &offset,
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\","
-        "\"params\":{\"uri\":\"%s\",\"diagnostics\":[", doc->uri);
+        "\"params\":{\"uri\":\"%s\",\"diagnostics\":[", escaped_uri);
 
     if (!func && err_output[0]) {
         const char *line_start = err_output;
@@ -1648,7 +2053,7 @@ static void publish_diagnostics(OpenDoc *doc) {
         }
     }
 
-    offset += snprintf(diag_json + offset, sizeof(diag_json) - offset, "]}}");
+    append_json(diag_json, sizeof(diag_json), &offset, "]}}");
 
     vm_free(vm);
     free(vm);
@@ -1676,7 +2081,7 @@ static void handle_initialize(int id) {
         "\"keyword\",\"variable\",\"function\",\"module\",\"property\",\"struct\",\"enum\","
         "\"string\",\"number\",\"null\",\"comment\",\"operator\"],\"tokenModifiers\":[]},"
         "\"full\":true}"
-        "},\"serverInfo\":{\"name\":\"Magnesium Language Server\",\"version\":\"1.0.0\"}}}", id);
+        "},\"serverInfo\":{\"name\":\"Magnesium Language Server\",\"version\":\"1.1.0\"}}}", id);
     write_response(resp);
 }
 
@@ -1713,10 +2118,17 @@ static void handle_did_change(const char *json) {
 static void handle_did_close(const char *json) {
     char *uri = extract_string(json, "uri");
     if (!uri) return;
-    OpenDoc *doc = find_doc(uri);
-    if (doc) {
-        free(doc->text);
-        doc->text = NULL;
+    for (int i = 0; i < open_doc_count; i++) {
+        if (strcmp(open_docs[i].uri, uri) == 0) {
+            free(open_docs[i].text);
+            if (i + 1 < open_doc_count) {
+                memmove(&open_docs[i], &open_docs[i + 1],
+                        (size_t)(open_doc_count - i - 1) * sizeof(OpenDoc));
+            }
+            open_doc_count--;
+            memset(&open_docs[open_doc_count], 0, sizeof(OpenDoc));
+            break;
+        }
     }
     free(uri);
 }
@@ -1728,6 +2140,10 @@ static void handle_shutdown(int id) {
 }
 
 bool mg_lsp_run(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     while (true) {
         char *msg = read_message();
         if (!msg) break;

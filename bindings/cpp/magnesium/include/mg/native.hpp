@@ -3,10 +3,9 @@
 #include <mg/value.hpp>
 #include <mg/error.hpp>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <string>
-
-extern "C" void* mg_get_native_userdata(::VM* vm);
 
 namespace mg {
 
@@ -14,14 +13,14 @@ class Vm;
 
 class NativeContext {
 public:
-    NativeContext(Vm& vm, const Value* args, size_t count)
+    NativeContext(Vm& vm, const ::Value* args, size_t count)
         : vm_(&vm), args_(args), count_(count) {}
 
     Vm& vm() { return *vm_; }
 
     std::optional<Value> arg(size_t index) const {
         if (index >= count_) return std::nullopt;
-        return args_[index];
+        return Value::from_raw(args_[index]);
     }
     size_t arg_count() const { return count_; }
 
@@ -44,14 +43,19 @@ public:
 
 private:
     Vm* vm_;
-    const Value* args_;
+    const ::Value* args_;
     size_t count_;
 };
 
 using NativeClosure = std::function<Value(NativeContext&)>;
 
-struct NativeClosureWrap {
+struct VmControl {
     Vm* owner;
+    ::VM* raw;
+};
+
+struct NativeClosureWrap {
+    std::shared_ptr<VmControl> vm_control;
     NativeClosure fn;
 };
 
@@ -64,18 +68,27 @@ inline ::Value native_trampoline(::VM* vm, int32_t arg_count, ::Value* args) {
     if (!userdata) return Value::null().to_raw();
 
     auto* wrap = static_cast<NativeClosureWrap*>(userdata);
-    if (!wrap->owner) return Value::null().to_raw();
+    if (!wrap->vm_control || !wrap->vm_control->owner ||
+        !wrap->vm_control->raw) {
+        return Value::null().to_raw();
+    }
 
-    auto* val_args = reinterpret_cast<const Value*>(args);
     size_t count = (arg_count > 0 && args) ? static_cast<size_t>(arg_count) : 0;
 
-    NativeContext ctx(*wrap->owner, val_args, count);
-    return wrap->fn(ctx).to_raw();
+    try {
+        NativeContext ctx(*wrap->vm_control->owner, args, count);
+        return wrap->fn(ctx).to_raw();
+    } catch (const std::exception& error) {
+        vm_runtime_error(vm, "native callback failed: %s", error.what());
+    } catch (...) {
+        vm_runtime_error(vm, "native callback failed with an unknown C++ exception");
+    }
+    return Value::null().to_raw();
 }
 
 template<typename T>
 struct MethodClosure {
-    Vm* owner;
+    std::shared_ptr<VmControl> vm_control;
     std::string type_name_str;
     std::function<Value(T&, NativeContext&)> fn;
 };
@@ -93,18 +106,27 @@ template<typename T>
     if (!userdata) return Value::null().to_raw();
 
     auto* mc = static_cast<MethodClosure<T>*>(userdata);
-    if (!mc->owner) return Value::null().to_raw();
+    if (!mc->vm_control || !mc->vm_control->owner || !mc->vm_control->raw) {
+        return Value::null().to_raw();
+    }
 
     Value self_val = Value::from_raw(args[0]);
     void* data = vm_native_handle_data(self_val.to_raw(), mc->type_name_str.c_str());
     if (!data) return Value::null().to_raw();
     auto* typed = static_cast<T*>(data);
 
-    auto* val_args = reinterpret_cast<const Value*>(args) + 1;
+    auto* val_args = args + 1;
     size_t count = (arg_count > 1) ? static_cast<size_t>(arg_count - 1) : 0;
 
-    NativeContext ctx(*mc->owner, val_args, count);
-    return mc->fn(*typed, ctx).to_raw();
+    try {
+        NativeContext ctx(*mc->vm_control->owner, val_args, count);
+        return mc->fn(*typed, ctx).to_raw();
+    } catch (const std::exception& error) {
+        vm_runtime_error(vm, "native method failed: %s", error.what());
+    } catch (...) {
+        vm_runtime_error(vm, "native method failed with an unknown C++ exception");
+    }
+    return Value::null().to_raw();
 }
 
 } // namespace mg

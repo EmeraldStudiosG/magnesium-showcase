@@ -1,6 +1,9 @@
 use std::ffi::c_void;
+use std::rc::Rc;
 
 use magnesium_sys as sys;
+
+use crate::vm::{RootHandle, VmInner};
 
 const QNAN: u64 = sys::QNAN;
 const SIGN_BIT: u64 = sys::SIGN_BIT;
@@ -9,48 +12,74 @@ const TAG_FALSE: u64 = sys::TAG_FALSE;
 const TAG_TRUE: u64 = sys::TAG_TRUE;
 const TAG_INT: u64 = sys::TAG_INT;
 
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-pub struct Value(pub(crate) u64);
+#[derive(Clone)]
+pub struct Value {
+    raw: u64,
+    // VM-backed values keep their VM alive and retain the object through the
+    // host-root API. Clones share one root.
+    root: Option<Rc<RootHandle>>,
+    // Only unsafe constructors can create an unowned object value.
+    trusted_unowned: bool,
+}
 
 impl Value {
     #[inline(always)]
+    const fn primitive(raw: u64) -> Self {
+        Self {
+            raw,
+            root: None,
+            trusted_unowned: false,
+        }
+    }
+
+    #[inline(always)]
     pub const fn null() -> Self {
-        Value(QNAN | TAG_NULL)
+        Self::primitive(QNAN | TAG_NULL)
     }
 
     #[inline(always)]
     pub const fn false_val() -> Self {
-        Value(QNAN | TAG_FALSE)
+        Self::primitive(QNAN | TAG_FALSE)
     }
 
     #[inline(always)]
     pub const fn true_val() -> Self {
-        Value(QNAN | TAG_TRUE)
+        Self::primitive(QNAN | TAG_TRUE)
     }
 
     #[inline(always)]
     pub const fn bool_val(b: bool) -> Self {
         if b {
-            Value(QNAN | TAG_TRUE)
+            Self::true_val()
         } else {
-            Value(QNAN | TAG_FALSE)
+            Self::false_val()
         }
     }
 
     #[inline(always)]
     pub const fn int_val(n: i32) -> Self {
-        Value(QNAN | TAG_INT | ((n as u32 as u64) << 3))
+        Self::primitive(QNAN | TAG_INT | ((n as u32 as u64) << 3))
     }
 
     #[inline(always)]
     pub fn number_val(n: f64) -> Self {
-        Value(n.to_bits())
+        let bits = n.to_bits();
+        // A user-controlled NaN payload must never be interpreted as an
+        // object pointer by the NaN-boxing scheme.
+        if (bits & QNAN) == QNAN {
+            Self::primitive(f64::NAN.to_bits())
+        } else {
+            Self::primitive(bits)
+        }
     }
 
     #[inline(always)]
-    pub fn obj_val(ptr: *const c_void) -> Self {
-        Value(SIGN_BIT | QNAN | (ptr as u64))
+    pub unsafe fn obj_val(ptr: *const c_void) -> Self {
+        Self {
+            raw: SIGN_BIT | QNAN | (ptr as u64),
+            root: None,
+            trusted_unowned: true,
+        }
     }
 
     #[inline(always)]
@@ -66,22 +95,22 @@ impl Value {
 
     #[inline(always)]
     pub fn is_null(&self) -> bool {
-        *self == Self::null()
+        self.raw == (QNAN | TAG_NULL)
     }
 
     #[inline(always)]
     pub fn is_bool(&self) -> bool {
-        (self.0 | 1) == (QNAN | TAG_TRUE)
+        (self.raw | 1) == (QNAN | TAG_TRUE)
     }
 
     #[inline(always)]
     pub fn is_int(&self) -> bool {
-        (self.0 & (SIGN_BIT | QNAN | 0x7)) == (QNAN | TAG_INT)
+        (self.raw & (SIGN_BIT | QNAN | 0x7)) == (QNAN | TAG_INT)
     }
 
     #[inline(always)]
     pub fn is_number(&self) -> bool {
-        (self.0 & QNAN) != QNAN
+        (self.raw & QNAN) != QNAN
     }
 
     #[inline(always)]
@@ -91,17 +120,17 @@ impl Value {
 
     #[inline(always)]
     pub fn is_obj(&self) -> bool {
-        (self.0 & (SIGN_BIT | QNAN)) == (SIGN_BIT | QNAN) && (self.0 & 0x7) == 0
+        (self.raw & (SIGN_BIT | QNAN)) == (SIGN_BIT | QNAN) && (self.raw & 0x7) == 0
     }
 
     #[inline(always)]
     pub fn as_bool(&self) -> bool {
-        *self == Self::true_val()
+        self.raw == (QNAN | TAG_TRUE)
     }
 
     #[inline(always)]
     pub fn as_int(&self) -> i32 {
-        ((self.0 >> 3) & 0xFFFF_FFFF) as i32
+        ((self.raw >> 3) & 0xFFFF_FFFF) as i32
     }
 
     #[inline(always)]
@@ -109,18 +138,18 @@ impl Value {
         if self.is_int() {
             self.as_int() as f64
         } else {
-            f64::from_bits(self.0)
+            f64::from_bits(self.raw)
         }
     }
 
     #[inline(always)]
     pub fn as_double(&self) -> f64 {
-        f64::from_bits(self.0)
+        f64::from_bits(self.raw)
     }
 
     #[inline(always)]
-    pub fn as_obj(&self) -> *mut sys::Obj {
-        (self.0 & !(SIGN_BIT | QNAN)) as *mut sys::Obj
+    pub unsafe fn as_obj(&self) -> *mut sys::Obj {
+        (self.raw & !(SIGN_BIT | QNAN)) as *mut sys::Obj
     }
 
     #[inline(always)]
@@ -130,7 +159,7 @@ impl Value {
 
     #[inline(always)]
     pub fn obj_type(&self) -> Option<sys::ObjType> {
-        if self.is_obj() {
+        if self.is_obj() && (self.root.is_some() || self.trusted_unowned) {
             Some(unsafe { (*self.as_obj()).type_ })
         } else {
             None
@@ -178,7 +207,7 @@ impl Value {
     }
 
     #[inline(always)]
-    pub fn as_native_handle(&self) -> *mut sys::ObjNativeHandle {
+    pub unsafe fn as_native_handle(&self) -> *mut sys::ObjNativeHandle {
         self.as_obj().cast()
     }
 
@@ -208,81 +237,193 @@ impl Value {
 
     #[inline(always)]
     pub const fn to_bits(&self) -> u64 {
-        self.0
+        self.raw
     }
 
     #[inline(always)]
-    pub const fn from_bits(bits: u64) -> Self {
-        Value(bits)
+    pub const unsafe fn from_bits(bits: u64) -> Self {
+        Self {
+            raw: bits,
+            root: None,
+            trusted_unowned: true,
+        }
     }
 
     #[inline(always)]
     pub fn try_as_bool(&self) -> Option<bool> {
-        if self.is_bool() { Some(self.as_bool()) } else { None }
+        if self.is_bool() {
+            Some(self.as_bool())
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn try_as_int(&self) -> Option<i32> {
-        if self.is_int() { Some(self.as_int()) } else { None }
+        if self.is_int() {
+            Some(self.as_int())
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn try_as_number(&self) -> Option<f64> {
-        if self.is_number() { Some(self.as_double()) } else { None }
+        if self.is_number() {
+            Some(self.as_double())
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn try_as_numeric(&self) -> Option<f64> {
-        if self.is_int() { Some(self.as_int() as f64) }
-        else if self.is_number() { Some(self.as_double()) }
-        else { None }
+        if self.is_int() {
+            Some(self.as_int() as f64)
+        } else if self.is_number() {
+            Some(self.as_double())
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
-    pub fn try_as_obj(&self) -> Option<*mut sys::Obj> {
-        if self.is_obj() { Some(self.as_obj()) } else { None }
+    pub unsafe fn try_as_obj(&self) -> Option<*mut sys::Obj> {
+        if self.is_obj() {
+            Some(self.as_obj())
+        } else {
+            None
+        }
     }
 
     pub fn try_as_string(&self) -> Option<&str> {
-        if !self.is_string() { return None; }
-        let obj = self.as_obj();
+        if !self.is_string() {
+            return None;
+        }
+        let obj = unsafe { self.as_obj() };
         unsafe {
             let s = &*(obj as *const sys::ObjString);
-            if s.chars.is_null() || s.is_rope { return None; }
-            let slice = std::slice::from_raw_parts(s.chars as *const u8, s.length as usize);
-            Some(std::str::from_utf8_unchecked(slice))
+            if s.length < 0 {
+                return None;
+            }
+            let chars = if s.is_rope {
+                let owner = self.owner()?;
+                sys::string_chars(owner.raw(), obj.cast())
+            } else {
+                s.chars
+            };
+            if chars.is_null() {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(chars as *const u8, s.length as usize);
+            std::str::from_utf8(slice).ok()
         }
     }
 
     pub fn expect_bool(&self) -> bool {
-        self.try_as_bool().unwrap_or_else(|| panic!("expected bool, got {:?}", self))
+        self.try_as_bool()
+            .unwrap_or_else(|| panic!("expected bool, got {:?}", self))
     }
 
     pub fn expect_int(&self) -> i32 {
-        self.try_as_int().unwrap_or_else(|| panic!("expected int, got {:?}", self))
+        self.try_as_int()
+            .unwrap_or_else(|| panic!("expected int, got {:?}", self))
     }
 
     pub fn expect_number(&self) -> f64 {
-        self.try_as_number().unwrap_or_else(|| panic!("expected number, got {:?}", self))
+        self.try_as_number()
+            .unwrap_or_else(|| panic!("expected number, got {:?}", self))
     }
 
     pub fn expect_numeric(&self) -> f64 {
-        self.try_as_numeric().unwrap_or_else(|| panic!("expected numeric, got {:?}", self))
+        self.try_as_numeric()
+            .unwrap_or_else(|| panic!("expected numeric, got {:?}", self))
     }
 
-    pub fn to_raw(self) -> sys::Value {
-        self.0
+    pub fn to_raw(&self) -> sys::Value {
+        self.raw
     }
 
-    pub fn from_raw(raw: sys::Value) -> Self {
-        Value(raw)
+    pub unsafe fn from_raw(raw: sys::Value) -> Self {
+        Self {
+            raw,
+            root: None,
+            trusted_unowned: true,
+        }
+    }
+
+    pub fn to_owned_string(&self) -> Option<String> {
+        if !self.is_string() {
+            return None;
+        }
+        let owner = self.owner()?;
+        let mut required = 0usize;
+        unsafe {
+            sys::vm_string_copy(
+                owner.raw(),
+                self.raw,
+                std::ptr::null_mut(),
+                0,
+                &mut required,
+            );
+        }
+        if required == 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; required];
+        let copied = unsafe {
+            sys::vm_string_copy(
+                owner.raw(),
+                self.raw,
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut required,
+            )
+        };
+        if !copied || required == 0 || required > bytes.len() {
+            return None;
+        }
+        bytes.truncate(required - 1);
+        String::from_utf8(bytes).ok()
+    }
+
+    pub(crate) fn from_vm_raw(raw: sys::Value, owner: Rc<VmInner>) -> Self {
+        if Self::raw_is_obj(raw) {
+            Self {
+                raw,
+                root: Some(RootHandle::new(owner, raw)),
+                trusted_unowned: false,
+            }
+        } else {
+            Self::primitive(raw)
+        }
+    }
+
+    pub(crate) fn raw_ref(&self) -> sys::Value {
+        self.raw
+    }
+
+    pub(crate) fn owner(&self) -> Option<&Rc<VmInner>> {
+        self.root.as_ref().map(|root| root.owner())
+    }
+
+    pub(crate) fn belongs_to(&self, owner: &Rc<VmInner>) -> bool {
+        !self.is_obj()
+            || self
+                .owner()
+                .is_some_and(|value_owner| Rc::ptr_eq(value_owner, owner))
+    }
+
+    #[inline(always)]
+    fn raw_is_obj(raw: u64) -> bool {
+        (raw & (SIGN_BIT | QNAN)) == (SIGN_BIT | QNAN) && (raw & 0x7) == 0
     }
 }
 
 impl PartialEq for Value {
     #[inline(always)]
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.raw == other.raw
     }
 }
 
@@ -317,7 +458,7 @@ impl std::fmt::Debug for Value {
                 _ => write!(f, "Value(obj)"),
             }
         } else {
-            write!(f, "Value(0x{:016x})", self.0)
+            write!(f, "Value(0x{:016x})", self.raw)
         }
     }
 }

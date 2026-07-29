@@ -1,0 +1,26 @@
+1
+12
+1
+1
+15
+42
+inner return defer
+outer return defer
+7
+loop defer 0
+loop defer 1
+normal loop defer 0
+normal loop defer 1
+iterator defer a
+iterator defer b
+lookup defer
+null
+catch defer
+caught
+comparison chain
+7
+9
+true:false:null
+nested
+}
+11

@@ -37,11 +37,6 @@ fn as_int_value(v: Value) -> i32 {
     ((v >> 3) & 0xFFFF_FFFF) as i32
 }
 
-#[inline(always)]
-fn obj_val(ptr: *const std::ffi::c_void) -> Value {
-    SIGN_BIT | QNAN | (ptr as u64)
-}
-
 unsafe extern "C" fn rust_add(_vm: *mut VM, arg_count: libc::c_int, args: *mut Value) -> Value {
     if arg_count < 2 {
         return null_val();
@@ -66,16 +61,23 @@ unsafe extern "C" fn rust_add(_vm: *mut VM, arg_count: libc::c_int, args: *mut V
 
 fn main() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = vm_new();
+        assert!(!vm.is_null(), "vm_new returned null");
 
         let c_name = CString::new("rust_add").unwrap();
-        let key = copy_string(vm, c_name.as_ptr(), 9);
-        let native = new_native(vm, Some(rust_add), c_name.as_ptr(), 2);
-        table_set(&mut (*vm).globals, key, obj_val(native as *const _));
+        vm_register_native(
+            vm,
+            c_name.as_ptr(),
+            Some(rust_add),
+            2,
+            std::ptr::null_mut(),
+            None,
+        );
 
-        let mg_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/syntax_test.mg");
+        let mg_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../examples/syntax_test.mg"
+        );
         let source = fs::read_to_string(mg_path).expect("failed to read syntax_test.mg");
         let c_source = CString::new(source).unwrap();
         let c_script = CString::new("examples/syntax_test.mg").unwrap();
@@ -89,6 +91,6 @@ fn main() {
             InterpretResult::Yield => eprintln!("\n[Rust/sys] Yielded"),
         }
 
-        vm_free(vm);
+        vm_delete(vm);
     }
 }

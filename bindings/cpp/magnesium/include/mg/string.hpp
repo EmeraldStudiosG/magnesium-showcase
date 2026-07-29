@@ -1,13 +1,11 @@
 #pragma once
 
-#include <mg/value.hpp>
+#include <mg/vm.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace mg {
-
-class Vm;
 
 class MgString {
 public:
@@ -21,7 +19,16 @@ public:
         return std::string_view(raw->chars, static_cast<size_t>(raw->length));
     }
 
-    std::optional<std::string> resolve(Vm& vm) const;
+    std::optional<std::string> resolve(Vm& vm) const {
+        if (!raw) return std::nullopt;
+        ::VMRoot* root = vm_root_value(vm.raw_mut(), Value::obj_val(raw).to_raw());
+        if (!root) return std::nullopt;
+        const char* chars = string_chars(vm.raw_mut(), raw);
+        std::optional<std::string> result;
+        if (chars) result = std::string(chars, static_cast<size_t>(raw->length));
+        vm_unroot_value(vm.raw_mut(), root);
+        return result;
+    }
 
     int32_t length() const { return raw ? raw->length : 0; }
     uint32_t hash() const { return raw ? raw->hash : 0; }

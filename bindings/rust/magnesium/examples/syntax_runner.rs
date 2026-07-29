@@ -17,9 +17,12 @@ unsafe extern "C" fn rust_add(
 fn main() {
     let mut vm = Vm::new();
 
-    vm.register_native("rust_add", Some(rust_add), 2);
+    unsafe { vm.register_native("rust_add", Some(rust_add), 2) };
 
-    let mg_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/syntax_test.mg");
+    let mg_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../examples/syntax_test.mg"
+    );
     let source = fs::read_to_string(mg_path).expect("failed to read syntax_test.mg");
 
     let result = vm.interpret_named(&source, "examples/syntax_test.mg");

@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <math.h>
 #include "magnesium.h"
 
 #ifdef _WIN32
@@ -12,6 +14,29 @@
 
 static void print_string(ObjString *string);
 
+int format_number(char *buffer, size_t capacity, double number) {
+    if (!buffer || capacity == 0) return -1;
+    if (isfinite(number) && trunc(number) == number &&
+        number >= -9007199254740991.0 && number <= 9007199254740991.0) {
+        return snprintf(buffer, capacity, "%.0f", number);
+    }
+    if (!isfinite(number)) {
+        return snprintf(buffer, capacity, "%g", number);
+    }
+
+    /* Pick the shortest %g representation that parses back to the same
+       double. This keeps output readable without the six-digit truncation
+       of bare %g. */
+    for (int precision = 1; precision <= 17; precision++) {
+        int length = snprintf(buffer, capacity, "%.*g", precision, number);
+        if (length < 0 || (size_t)length >= capacity) return length;
+        char *end = NULL;
+        double parsed = strtod(buffer, &end);
+        if (end && *end == '\0' && parsed == number) return length;
+    }
+    return snprintf(buffer, capacity, "%.17g", number);
+}
+
 /* ========================================================================
  * Value helpers
  * ======================================================================== */
@@ -20,8 +45,14 @@ void print_value(Value value) {
         printf("null");
     } else if (IS_BOOL(value)) {
         printf(AS_BOOL(value) ? "true" : "false");
-    } else if (IS_NUMERIC(value)) {
-        printf("%g", AS_NUMBER(value));
+    } else if (IS_INT(value)) {
+        printf("%d", AS_INT(value));
+    } else if (IS_NUMBER(value)) {
+        char buffer[64];
+        int length = format_number(buffer, sizeof(buffer), AS_NUMBER(value));
+        if (length > 0 && (size_t)length < sizeof(buffer)) {
+            fwrite(buffer, 1, (size_t)length, stdout);
+        }
     } else if (IS_OBJ(value)) {
             Obj *obj = AS_OBJ(value);
             switch (obj->type) {
@@ -40,10 +71,10 @@ void print_value(Value value) {
                     else printf("<script>");
                     break;
                 case OBJ_NATIVE:
-                    printf("<native %s>", AS_NATIVE(value)->name);
+                    printf("<native %s>", AS_NATIVE(value)->name->chars);
                     break;
                 case OBJ_FFI:
-                    printf("<ffi %s>", AS_FFI(value)->name);
+                    printf("<ffi %s>", AS_FFI(value)->name->chars);
                     break;
                 case OBJ_NATIVE_HANDLE:
                     printf("<native-handle %s>", AS_NATIVE_HANDLE(value)->type_name->chars);
@@ -62,12 +93,18 @@ void print_value(Value value) {
                     break;
                 case OBJ_ERROR: {
                     ObjError *err = AS_ERROR(value);
-                    printf("error[%s]: %s", err->kind->chars, err->message->chars);
+                    printf("error[");
+                    print_string(err->kind);
+                    printf("]: ");
+                    print_string(err->message);
                     if (err->file && err->line > 0) {
-                        printf("\n  at %s:%d", err->file->chars, err->line);
+                        printf("\n  at ");
+                        print_string(err->file);
+                        printf(":%d", err->line);
                     }
                     if (err->hint && err->hint->length > 0) {
-                        printf("\n  hint: %s", err->hint->chars);
+                        printf("\n  hint: ");
+                        print_string(err->hint);
                     }
                     break;
                 }
@@ -251,11 +288,21 @@ static void slab_refill(VM *vm, uint8_t class_idx) {
 }
 
 Obj *allocate_object(VM *vm, size_t size, ObjType type) {
-    if (vm->young_bytes + size > 8 * 1024 * 1024) {
-        gc_minor_collect(vm);
-    }
-    if (vm->bytes_allocated + size > vm->next_gc) {
+    const size_t nursery_limit = (size_t)8 * 1024 * 1024;
+    bool needs_major = size > vm->next_gc ||
+                       vm->bytes_allocated > vm->next_gc - size;
+    bool needs_minor = size > nursery_limit ||
+                       vm->young_bytes > nursery_limit - size;
+
+    /*
+     * A major collection already collects both generations. Running a minor
+     * first would age unrooted newborns held by in-progress C constructors,
+     * then let the immediately following major collection sweep them.
+     */
+    if (needs_major) {
         gc_major_collect(vm);
+    } else if (needs_minor) {
+        gc_minor_collect(vm);
     }
 
     Obj *obj;
@@ -352,6 +399,11 @@ ObjString *take_string(VM *vm, char *chars, int length) {
 }
 
 ObjString *concat_strings(VM *vm, ObjString *a, ObjString *b) {
+    if (!vm || !a || !b) return NULL;
+    if (b->length > INT_MAX - a->length) {
+        vm_runtime_error(vm, "Concatenated string is too large.");
+        return NULL;
+    }
     int length = a->length + b->length;
     ObjString *string = (ObjString *)allocate_object(vm, sizeof(ObjString), OBJ_STRING);
     string->length = length;
@@ -397,6 +449,7 @@ ObjClosure *new_closure(VM *vm, ObjFunction *function) {
             c->obj.gc_age = 0;
             c->obj.alloc_size = size;
             closure = c;
+            vm->young_bytes += size;
             break;
         }
         prev = (ObjClosure **)&c->obj.next;
@@ -429,6 +482,7 @@ ObjUpvalue *new_upvalue(VM *vm, Value *slot) {
         upvalue->obj.is_old = false;
         upvalue->obj.gc_age = 0;
         upvalue->obj.alloc_size = sizeof(ObjUpvalue);
+        vm->young_bytes += sizeof(ObjUpvalue);
     } else {
         upvalue = (ObjUpvalue *)allocate_object(vm, sizeof(ObjUpvalue), OBJ_UPVALUE);
     }
@@ -439,17 +493,18 @@ ObjUpvalue *new_upvalue(VM *vm, Value *slot) {
     return upvalue;
 }
 
-ObjNative *new_native(VM *vm, NativeFn function, const char *name, int arity) {
+ObjNative *new_native(VM *vm, NativeFn function, ObjString *name, int arity) {
     ObjNative *native = (ObjNative *)allocate_object(vm, sizeof(ObjNative), OBJ_NATIVE);
     native->function = function;
     native->name = name;
     native->arity = arity;
+    native->copy_args = true;
     native->userdata = NULL;
     native->userdata_finalizer = NULL;
     return native;
 }
 
-ObjFFI *new_ffi(VM *vm, void *c_func, const char *name, int arity) {
+ObjFFI *new_ffi(VM *vm, void *c_func, ObjString *name, int arity) {
     ObjFFI *ffi = (ObjFFI *)allocate_object(vm, sizeof(ObjFFI), OBJ_FFI);
     ffi->c_function = c_func;
     ffi->name = name;
@@ -467,6 +522,7 @@ ObjNativeHandle *new_native_handle(VM *vm, ObjString *type_name, void *data,
     handle->finalizer = finalizer;
     vm_push(vm, OBJ_VAL(handle));
     handle->methods = new_dict(vm);
+    gc_write_barrier(vm, (Obj *)handle, OBJ_VAL(handle->methods));
     vm_pop(vm);
     return handle;
 }
@@ -483,9 +539,22 @@ ObjArray *new_array(VM *vm) {
 }
 
 void array_push(VM *vm, ObjArray *array, Value value) {
+    if (!vm || !array) return;
+    if (array->count == INT_MAX) {
+        fprintf(stderr, "Array is too large.\n");
+        exit(1);
+    }
     if (array->capacity < array->count + 1) {
         int old_cap = array->capacity;
+        if (old_cap > INT_MAX / 2) {
+            fprintf(stderr, "Array is too large.\n");
+            exit(1);
+        }
         int new_cap = array->capacity < 8 ? 8 : array->capacity * 2;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(Value)) {
+            fprintf(stderr, "Array is too large.\n");
+            exit(1);
+        }
         Value *items = realloc(array->items, sizeof(Value) * new_cap);
         if (!items) {
             fprintf(stderr, "Out of memory growing array.\n");
@@ -504,9 +573,11 @@ Value array_get(ObjArray *array, int index) {
     return array->items[index];
 }
 
-void array_set(ObjArray *array, int index, Value value) {
+void array_set(VM *vm, ObjArray *array, int index, Value value) {
+    if (!vm || !array) return;
     if (index < 0 || index >= array->count) return;
     array->items[index] = value;
+    gc_write_barrier(vm, (Obj *)array, value);
 }
 
 /* ========================================================================
@@ -519,7 +590,7 @@ ObjDict *new_dict(VM *vm) {
     dict->version = 1;
     dict->mono_cache_key = NULL;
     dict->mono_cache_entry = NULL;
-    dict->mono_cache_version = 0;
+    dict->mono_cache_value = NULL_VAL;
     dict->indices = NULL;
     dict->entry_count = 0;
     dict->entry_capacity = 0;
@@ -610,7 +681,7 @@ void dict_adjust_capacity(VM *vm, ObjDict *dict, int capacity) {
     dict->version++;
     dict->mono_cache_key = NULL;
     dict->mono_cache_entry = NULL;
-    dict->mono_cache_version = 0;
+    dict->mono_cache_value = NULL_VAL;
     vm->bytes_allocated += (new_indices_size + new_entries_size) -
                            (old_indices_size + old_entries_size);
 }
@@ -645,13 +716,19 @@ bool dict_set(VM *vm, ObjDict *dict, ObjString *key, Value value) {
         entry->hash = key->hash;
     }
     entry->value = value;
-    /* Keep the per-dict mono cache warm for the key we just touched. */
-    dict->mono_cache_key = key;
+    /*
+     * Cache the dictionary-owned key, not an equal temporary lookup key such
+     * as a rope. Cache pointers are weak and are not traced by GC.
+     */
+    ObjString *stored_key = entry->key;
+    dict->mono_cache_key = stored_key;
     dict->mono_cache_entry = entry;
-    dict->mono_cache_version = dict->version;
+    dict->mono_cache_value = value;
     if (((Obj *)dict)->is_old) {
         if (IS_OBJ(value)) gc_write_barrier(vm, (Obj *)dict, value);
-        if (!((Obj *)key)->is_old) gc_write_barrier(vm, (Obj *)dict, OBJ_VAL(key));
+        if (!((Obj *)stored_key)->is_old) {
+            gc_write_barrier(vm, (Obj *)dict, OBJ_VAL(stored_key));
+        }
     }
     return is_new;
 }
@@ -667,6 +744,9 @@ bool dict_delete(ObjDict *dict, ObjString *key) {
     entry->value = TRUE_VAL;
     dict->count--;
     dict->version++;
+    dict->mono_cache_key = NULL;
+    dict->mono_cache_entry = NULL;
+    dict->mono_cache_value = NULL_VAL;
     return true;
 }
 
@@ -682,6 +762,7 @@ ObjStruct *new_struct(VM *vm, ObjString *name) {
     table_init(&s->field_index);
     vm_push(vm, OBJ_VAL(s));
     s->methods = new_dict(vm);
+    gc_write_barrier(vm, (Obj *)s, OBJ_VAL(s->methods));
     vm_pop(vm);
     return s;
 }
@@ -698,6 +779,11 @@ ObjInstance *new_instance(VM *vm, ObjStruct *klass) {
 ObjError *new_error(VM *vm, ObjString *kind, ObjString *message,
                     ObjString *file, int line, ObjString *function,
                     ObjString *hint) {
+    vm_push(vm, kind ? OBJ_VAL(kind) : NULL_VAL);
+    vm_push(vm, message ? OBJ_VAL(message) : NULL_VAL);
+    vm_push(vm, file ? OBJ_VAL(file) : NULL_VAL);
+    vm_push(vm, function ? OBJ_VAL(function) : NULL_VAL);
+    vm_push(vm, hint ? OBJ_VAL(hint) : NULL_VAL);
     ObjError *err = (ObjError *)allocate_object(vm, sizeof(ObjError), OBJ_ERROR);
     err->kind = kind;
     err->message = message;
@@ -705,6 +791,9 @@ ObjError *new_error(VM *vm, ObjString *kind, ObjString *message,
     err->function = function;
     err->hint = hint;
     err->line = line;
+    for (int i = 0; i < 5; i++) {
+        vm_pop(vm);
+    }
     return err;
 }
 
@@ -717,6 +806,7 @@ ObjVMTask *new_vm_task(VM *vm, const char *path) {
         exit(1);
     }
     memcpy(task->path, path, path_len + 1);
+    vm->bytes_allocated += path_len + 1;
     task->state = VM_TASK_RUNNING;
     task->result = INTERPRET_RUNTIME_ERROR;
     task->started = false;
@@ -759,6 +849,7 @@ ObjCoroutine *new_coroutine(VM *vm, ObjClosure *closure) {
     for (int i = 0; i < co->stack_capacity; i++) {
         co->stack[i] = NULL_VAL;
     }
+    vm->bytes_allocated += sizeof(Value) * (size_t)co->stack_capacity;
     memset(co->frames, 0, sizeof(co->frames));
     co->frame_count = 0;
     co->open_upvalues = NULL;

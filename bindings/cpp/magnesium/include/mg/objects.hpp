@@ -95,7 +95,11 @@ public:
 
     ::ObjFFI* raw;
 
-    std::string name() const { return raw && raw->name ? std::string(raw->name) : ""; }
+    std::string name() const {
+        return raw && raw->name
+            ? std::string(raw->name->chars, static_cast<size_t>(raw->name->length))
+            : "";
+    }
     int32_t arity() const { return raw ? raw->arity : 0; }
 };
 

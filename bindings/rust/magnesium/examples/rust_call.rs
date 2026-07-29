@@ -8,15 +8,20 @@ fn main() {
         let a = ctx.expect_numeric(0);
         let b = ctx.expect_numeric(1);
         Value::auto_val(a + b)
-    }).unwrap();
+    })
+    .unwrap();
 
     vm.register_native_fn("rust_greet", 1, |ctx: NativeContext| {
         let name = ctx.arg_string(0).unwrap_or("world");
         println!("Hello, {}! You called Rust from Magnesium.", name);
         Value::null()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let mg_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/rust_call.mg");
+    let mg_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../examples/rust_call.mg"
+    );
     let source = fs::read_to_string(mg_path).expect("failed to read rust_call.mg");
 
     let result = vm.interpret_named(&source, "examples/rust_call.mg");

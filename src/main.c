@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 #include "magnesium.h"
 #include "lsp.h"
 
@@ -24,9 +25,23 @@ static char *read_file(const char *path) {
         exit(74);
     }
 
-    fseek(file, 0L, SEEK_END);
-    size_t file_size = ftell(file);
-    rewind(file);
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        fprintf(stderr, "Could not seek file \"%s\".\n", path);
+        fclose(file);
+        exit(74);
+    }
+    long end = ftell(file);
+    if (end < 0 || (unsigned long)end > (unsigned long)(SIZE_MAX - 1)) {
+        fprintf(stderr, "Could not determine the size of \"%s\".\n", path);
+        fclose(file);
+        exit(74);
+    }
+    size_t file_size = (size_t)end;
+    if (fseek(file, 0L, SEEK_SET) != 0) {
+        fprintf(stderr, "Could not rewind file \"%s\".\n", path);
+        fclose(file);
+        exit(74);
+    }
 
     char *buffer = (char *)malloc(file_size + 1);
     if (!buffer) {
@@ -42,27 +57,47 @@ static char *read_file(const char *path) {
         free(buffer);
         exit(74);
     }
+    if (memchr(buffer, '\0', file_size) != NULL) {
+        fprintf(stderr, "Source file \"%s\" contains an embedded NUL byte.\n", path);
+        fclose(file);
+        free(buffer);
+        exit(65);
+    }
 
     buffer[bytes_read] = '\0';
-    fclose(file);
+    if (fclose(file) != 0) {
+        fprintf(stderr, "Could not close file \"%s\".\n", path);
+        free(buffer);
+        exit(74);
+    }
     return buffer;
 }
 
-static char *read_stdin(void) {
+static char *read_stdin(bool *contains_nul) {
     size_t capacity = 1024;
     size_t count = 0;
     char *buffer = malloc(capacity);
     if (!buffer) return NULL;
+    if (contains_nul) *contains_nul = false;
 
     int c;
     while ((c = getchar()) != EOF) {
         if (count + 1 >= capacity) {
+            if (capacity > SIZE_MAX / 2) {
+                free(buffer);
+                return NULL;
+            }
             capacity *= 2;
             char *new_buf = realloc(buffer, capacity);
             if (!new_buf) { free(buffer); return NULL; }
             buffer = new_buf;
         }
+        if (c == '\0' && contains_nul) *contains_nul = true;
         buffer[count++] = (char)c;
+    }
+    if (ferror(stdin)) {
+        free(buffer);
+        return NULL;
     }
     buffer[count] = '\0';
     return buffer;
@@ -74,6 +109,18 @@ static bool ends_with(const char *str, const char *suffix) {
     size_t len_suffix = strlen(suffix);
     if (len_suffix > len_str) return false;
     return strncmp(str + len_str - len_suffix, suffix, len_suffix) == 0;
+}
+
+static char *build_output_path(const char *source_path) {
+    size_t length = strlen(source_path);
+    bool replace_extension = ends_with(source_path, ".mg");
+    size_t stem_length = replace_extension ? length - 3 : length;
+    if (stem_length > SIZE_MAX - 5) return NULL;
+    char *output = (char *)malloc(stem_length + 5);
+    if (!output) return NULL;
+    memcpy(output, source_path, stem_length);
+    memcpy(output + stem_length, ".mgc", 5);
+    return output;
 }
 
 int main(int argc, char **argv) {
@@ -99,29 +146,29 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "build") == 0) {
             if (i + 1 < argc) {
                 const char *src_path = argv[i+1];
-                char out_path[1024];
-                snprintf(out_path, sizeof(out_path), "%s", src_path);
-                
-                char *dot = strrchr(out_path, '.');
-                if (dot && strcmp(dot, ".mg") == 0) {
-                    strcpy(dot, ".mgc");
-                } else {
-                    strcat(out_path, ".mgc");
+                if (i + 2 != argc) {
+                    fprintf(stderr, "Error: build accepts exactly one script path.\n");
+                    return 1;
+                }
+                char *out_path = build_output_path(src_path);
+                if (!out_path) {
+                    fprintf(stderr, "Out of memory creating output path.\n");
+                    return 1;
                 }
 
                 char *source = read_file(src_path);
-                VM *vm = calloc(1, sizeof(VM));
+                VM *vm = vm_new();
                 if (!vm) {
                     fprintf(stderr, "Out of memory.\n");
+                    free(out_path);
                     free(source);
                     return 1;
                 }
-                vm_init(vm);
                 ObjFunction *func = vm_compile_named(vm, source, src_path);
                 if (!func) {
                     fprintf(stderr, "Compilation failed.\n");
-                    vm_free(vm);
-                    free(vm);
+                    vm_delete(vm);
+                    free(out_path);
                     free(source);
                     return 65;
                 }
@@ -130,19 +177,25 @@ int main(int argc, char **argv) {
                     printf("Built %s\n", out_path);
                 } else {
                     fprintf(stderr, "Failed to write %s\n", out_path);
-                    vm_free(vm);
-                    free(vm);
+                    vm_delete(vm);
+                    free(out_path);
                     free(source);
                     return 1;
                 }
-                vm_free(vm);
-                free(vm);
+                vm_delete(vm);
+                free(out_path);
                 free(source);
                 return 0;
             } else {
                 fprintf(stderr, "Error: No script provided to build.\n");
                 return 1;
             }
+        } else if (argv[i][0] == '-' && strcmp(argv[i], "-") != 0) {
+            fprintf(stderr, "Error: Unknown option \"%s\".\n", argv[i]);
+            return 1;
+        } else if (script_path) {
+            fprintf(stderr, "Error: Multiple script paths were provided.\n");
+            return 1;
         } else {
             script_path = argv[i];
         }
@@ -154,20 +207,37 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    VM *vm = calloc(1, sizeof(VM));
+    VM *vm = vm_new();
     if (!vm) {
         fprintf(stderr, "Out of memory.\n");
         return 1;
     }
-    vm_init(vm);
     InterpretResult result;
 
     if (strcmp(script_path, "-") == 0) {
-        char *source = read_stdin();
+        bool contains_nul = false;
+        char *source = read_stdin(&contains_nul);
+        if (!source) {
+            fprintf(stderr, "Could not read standard input.\n");
+            vm_delete(vm);
+            return 74;
+        }
+        if (contains_nul) {
+            fprintf(stderr, "Standard input contains an embedded NUL byte.\n");
+            free(source);
+            vm_delete(vm);
+            return 65;
+        }
         if (check_only) {
             ObjFunction *func = vm_compile_named(vm, source, "<stdin>");
             result = func ? INTERPRET_OK : INTERPRET_COMPILE_ERROR;
             if (result == INTERPRET_OK) printf("Syntax OK\n");
+        } else if (time_execution) {
+            clock_t start = clock();
+            result = vm_interpret_named(vm, source, "<stdin>");
+            clock_t end = clock();
+            printf("\nExecution time: %.4f seconds\n",
+                   ((double)(end - start)) / CLOCKS_PER_SEC);
         } else {
             result = vm_interpret_named(vm, source, "<stdin>");
         }
@@ -176,11 +246,13 @@ int main(int argc, char **argv) {
         ObjFunction *func = vm_load_bytecode(vm, script_path);
         if (!func) {
             fprintf(stderr, "Could not load bytecode from %s\n", script_path);
-            vm_free(vm);
-            free(vm);
+            vm_delete(vm);
             return 1;
         }
-        if (time_execution) {
+        if (check_only) {
+            result = INTERPRET_OK;
+            printf("Bytecode OK\n");
+        } else if (time_execution) {
             clock_t start = clock();
             result = vm_run_function(vm, func);
             clock_t end = clock();
@@ -205,8 +277,7 @@ int main(int argc, char **argv) {
         free(source);
     }
 
-    vm_free(vm);
-    free(vm);
+    vm_delete(vm);
 
     switch (result) {
         case INTERPRET_COMPILE_ERROR: return 65;

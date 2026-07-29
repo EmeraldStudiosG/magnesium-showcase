@@ -7,9 +7,78 @@
 #include <string>
 #include <stdexcept>
 
+#if defined(_MSC_VER) && __cplusplus < 202302L
+// magnesium.h is a C header and includes <stdatomic.h>. The MSVC STL only
+// exposes that C compatibility header in C++23, so provide the one C type
+// present in Magnesium's public structs while parsing the C++17 wrapper.
+#define MG_CPP_SKIPPED_C_STDATOMIC
+#define __CLANG_STDATOMIC_H
+#define __MSVC_CXX_STDATOMIC_HPP
+#if defined(__clang__)
+typedef _Atomic(bool) atomic_bool;
+#else
+typedef bool atomic_bool;
+#endif
+#endif
+
+// GCC's <stdatomic.h> likewise does not expose the C atomic_bool typedef in
+// C++17 mode. Wrapper code treats VM internals as opaque and never performs
+// atomic operations on these fields, so this alias is only needed to parse the
+// public C structs.
+#if defined(__GNUC__) && !defined(__clang__) && __cplusplus < 202302L
+typedef bool atomic_bool;
+#endif
+
 extern "C" {
 #include "magnesium.h"
 }
+
+#ifdef MG_CPP_SKIPPED_C_STDATOMIC
+#undef __CLANG_STDATOMIC_H
+#undef __MSVC_CXX_STDATOMIC_HPP
+#undef MG_CPP_SKIPPED_C_STDATOMIC
+#endif
+
+// Clang's C <stdatomic.h> exposes function-like macros. Leaving them defined
+// breaks standard C++ headers such as <memory> and <atomic> when they are
+// included after this wrapper.
+#ifdef atomic_init
+#undef atomic_init
+#undef kill_dependency
+#undef atomic_thread_fence
+#undef atomic_signal_fence
+#undef atomic_is_lock_free
+#undef atomic_store
+#undef atomic_store_explicit
+#undef atomic_load
+#undef atomic_load_explicit
+#undef atomic_exchange
+#undef atomic_exchange_explicit
+#undef atomic_compare_exchange_strong
+#undef atomic_compare_exchange_strong_explicit
+#undef atomic_compare_exchange_weak
+#undef atomic_compare_exchange_weak_explicit
+#undef atomic_fetch_add
+#undef atomic_fetch_add_explicit
+#undef atomic_fetch_sub
+#undef atomic_fetch_sub_explicit
+#undef atomic_fetch_or
+#undef atomic_fetch_or_explicit
+#undef atomic_fetch_xor
+#undef atomic_fetch_xor_explicit
+#undef atomic_fetch_and
+#undef atomic_fetch_and_explicit
+#undef atomic_flag_test_and_set
+#undef atomic_flag_test_and_set_explicit
+#undef atomic_flag_clear
+#undef atomic_flag_clear_explicit
+#endif
+#ifdef ATOMIC_VAR_INIT
+#undef ATOMIC_VAR_INIT
+#endif
+#ifdef ATOMIC_FLAG_INIT
+#undef ATOMIC_FLAG_INIT
+#endif
 
 namespace mg {
 
@@ -55,7 +124,9 @@ public:
 
     constexpr bool is_null() const { return bits_ == (QNAN | TAG_NULL_VAL); }
     constexpr bool is_bool() const { return bits_ == (QNAN | TAG_FALSE_VAL) || bits_ == (QNAN | TAG_TRUE_VAL); }
-    constexpr bool is_int() const { return (bits_ & (QNAN | 0x7)) == (QNAN | TAG_INT_VAL); }
+    constexpr bool is_int() const {
+        return (bits_ & (SIGN_BIT | QNAN | 0x7)) == (QNAN | TAG_INT_VAL);
+    }
     bool is_number() const {
         if ((bits_ & (QNAN | SIGN_BIT)) == (QNAN | SIGN_BIT)) return false;
         double d;

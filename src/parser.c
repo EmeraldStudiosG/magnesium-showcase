@@ -181,6 +181,27 @@ void ast_free(ASTNode *node) {
             break;
 
         case NODE_ASSIGN:
+            /*
+             * Compound indexed assignments deliberately share the parsed
+             * receiver and index between the write target and the synthetic
+             * read on the right-hand side.  The compiler uses that identity
+             * to evaluate the lvalue exactly once.  Detach the non-owning
+             * references before recursively freeing the tree.
+             */
+            if (node->as.assign.target &&
+                node->as.assign.target->type == NODE_INDEX &&
+                node->as.assign.value &&
+                node->as.assign.value->type == NODE_BINARY &&
+                node->as.assign.value->as.binary.left &&
+                node->as.assign.value->as.binary.left->type == NODE_INDEX) {
+                ASTNode *target = node->as.assign.target;
+                ASTNode *read = node->as.assign.value->as.binary.left;
+                if (target->as.index_expr.object == read->as.index_expr.object &&
+                    target->as.index_expr.index == read->as.index_expr.index) {
+                    read->as.index_expr.object = NULL;
+                    read->as.index_expr.index = NULL;
+                }
+            }
             ast_free(node->as.assign.target);
             ast_free(node->as.assign.value);
             break;
@@ -206,6 +227,19 @@ void ast_free(ASTNode *node) {
             break;
 
         case NODE_FIELD_SET:
+            /*
+             * See NODE_ASSIGN above.  A compound field assignment shares its
+             * receiver with the synthetic field read so it can be compiled as
+             * one receiver evaluation.
+             */
+            if (node->as.field_set.value &&
+                node->as.field_set.value->type == NODE_BINARY &&
+                node->as.field_set.value->as.binary.left &&
+                node->as.field_set.value->as.binary.left->type == NODE_FIELD_GET &&
+                node->as.field_set.object ==
+                    node->as.field_set.value->as.binary.left->as.field_get.object) {
+                node->as.field_set.value->as.binary.left->as.field_get.object = NULL;
+            }
             ast_free(node->as.field_set.object);
             ast_free(node->as.field_set.value);
             break;
@@ -571,6 +605,15 @@ static ASTNode *parse_string_node(void) {
     return node;
 }
 
+static ASTNode *append_interp_part(ASTNode *result, ASTNode *part, int line) {
+    if (!result) return part;
+    ASTNode *cat = ast_alloc(NODE_BINARY, line);
+    cat->as.binary.op = TOKEN_PLUS;
+    cat->as.binary.left = result;
+    cat->as.binary.right = part;
+    return cat;
+}
+
 static ASTNode *parse_interp_string(void) {
     int line = ps.previous.line;
     /* Extract content between _" and " */
@@ -585,7 +628,14 @@ static ASTNode *parse_interp_string(void) {
     while (pos < total_len) {
         /* Find next '{' */
         int seg_start = pos;
-        while (pos < total_len && src[pos] != '{') pos++;
+        while (pos < total_len) {
+            if (src[pos] == '\\' && pos + 1 < total_len) {
+                pos += 2;
+                continue;
+            }
+            if (src[pos] == '{') break;
+            pos++;
+        }
 
         /* Emit literal segment if non-empty */
         if (pos > seg_start) {
@@ -596,15 +646,7 @@ static ASTNode *parse_interp_string(void) {
             lit->as.string.value[len] = '\0';
             lit->as.string.length = len;
 
-            if (!result) {
-                result = lit;
-            } else {
-                ASTNode *cat = ast_alloc(NODE_BINARY, line);
-                cat->as.binary.op = TOKEN_PLUS;
-                cat->as.binary.left = result;
-                cat->as.binary.right = lit;
-                result = cat;
-            }
+            result = append_interp_part(result, lit, line);
         }
 
         if (pos >= total_len) break;
@@ -613,59 +655,48 @@ static ASTNode *parse_interp_string(void) {
         pos++;
         int expr_start = pos;
         int brace_depth = 1;
+        bool in_string = false;
         while (pos < total_len && brace_depth > 0) {
-            if (src[pos] == '{') brace_depth++;
-            else if (src[pos] == '}') brace_depth--;
+            if (src[pos] == '\\' && pos + 1 < total_len) {
+                pos += 2;
+                continue;
+            }
+            if (src[pos] == '"') {
+                in_string = !in_string;
+            } else if (!in_string && src[pos] == '{') {
+                brace_depth++;
+            } else if (!in_string && src[pos] == '}') {
+                brace_depth--;
+            }
             if (brace_depth > 0) pos++;
         }
         int expr_len = pos - expr_start;
         if (pos < total_len) pos++; /* skip '}' */
 
         if (expr_len > 0) {
-            /* For simple identifiers (no dots, parens, etc.), create an
-               identifier node directly. For complex expressions, use sub-parse
-               with the source kept alive (token pointers reference the original
-               source which persists for the lifetime of compilation). */
-            ASTNode *expr = NULL;
+            /*
+             * Always use the normal lexer/parser.  Besides keeping interpolation
+             * semantics in sync with ordinary expressions, this recognizes
+             * keyword literals such as true, false, and null correctly.
+             * The closing '}' naturally terminates parse_expression().
+             */
+            ParserState saved = ps;
+            ps.scanner.start = src + expr_start;
+            ps.scanner.current = src + expr_start;
+            ps.scanner.line = line;
+            ps.current = (Token){0};
+            ps.previous = (Token){0};
+            ps.had_error = false;
+            ps.panic_mode = false;
 
-            /* Check if this is a simple identifier (alphanumeric + _) */
-            bool is_simple = true;
-            for (int k = 0; k < expr_len; k++) {
-                char c = src[expr_start + k];
-                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      c == '_' || (k > 0 && c >= '0' && c <= '9'))) {
-                    is_simple = false;
-                    break;
-                }
+            advance_token();
+            ASTNode *expr = parse_expression();
+            if (!check(TOKEN_RIGHT_BRACE)) {
+                error_current("Expected '}' after interpolation expression.");
             }
-
-            if (is_simple) {
-                /* Simple variable reference: create identifier directly */
-                expr = ast_alloc(NODE_IDENTIFIER, line);
-                expr->as.identifier.name.type = TOKEN_IDENTIFIER;
-                expr->as.identifier.name.start = src + expr_start;
-                expr->as.identifier.name.length = expr_len;
-                expr->as.identifier.name.line = line;
-                expr->as.identifier.is_global = false;
-            } else {
-                /* Complex expression sub-parse using the ORIGINAL source
-                   pointer (not a copy) so token pointers remain valid */
-                Scanner saved_scanner = ps.scanner;
-                Token saved_current = ps.current;
-                Token saved_previous = ps.previous;
-
-                /* Point scanner at the expression within the original source */
-                ps.scanner.start = src + expr_start;
-                ps.scanner.current = src + expr_start;
-                ps.scanner.line = line;
-
-                advance_token();
-                expr = parse_expression();
-
-                ps.scanner = saved_scanner;
-                ps.current = saved_current;
-                ps.previous = saved_previous;
-            }
+            bool interpolation_error = ps.had_error;
+            ps = saved;
+            if (interpolation_error) ps.had_error = true;
 
             /* Wrap in __builtin_tostring() call */
             ASTNode *tostr_id = ast_alloc(NODE_IDENTIFIER, line);
@@ -678,15 +709,7 @@ static ASTNode *parse_interp_string(void) {
             node_list_init(&call->as.call.args);
             node_list_write(&call->as.call.args, expr);
 
-            if (!result) {
-                result = call;
-            } else {
-                ASTNode *cat = ast_alloc(NODE_BINARY, line);
-                cat->as.binary.op = TOKEN_PLUS;
-                cat->as.binary.left = result;
-                cat->as.binary.right = call;
-                result = cat;
-            }
+            result = append_interp_part(result, call, line);
         }
     }
 
@@ -852,7 +875,30 @@ static bool less_starts_dict_index(void) {
         if (depth == 0) {
             switch (token.type) {
                 case TOKEN_GREATER:
-                    return saw_key_token;
+                    if (!saw_key_token) return false;
+                    /*
+                     * In `a < b and c > d`, the `>` is followed by another
+                     * operand on the same source line, so it is a comparison,
+                     * not the terminator of legacy dict-index syntax.
+                     */
+                    {
+                        Scanner after = lookahead;
+                        Token next = scan_token(&after);
+                        bool starts_operand =
+                            next.type == TOKEN_NUMBER ||
+                            next.type == TOKEN_STRING ||
+                            next.type == TOKEN_INTERP_STRING ||
+                            next.type == TOKEN_TRUE ||
+                            next.type == TOKEN_FALSE ||
+                            next.type == TOKEN_NULL ||
+                            next.type == TOKEN_IDENTIFIER ||
+                            next.type == TOKEN_AT ||
+                            next.type == TOKEN_AMPERSAND ||
+                            next.type == TOKEN_FN ||
+                            next.type == TOKEN_TRY;
+                        if (starts_operand && next.line == token.line) return false;
+                    }
+                    return true;
                 case TOKEN_THEN:
                 case TOKEN_END:
                 case TOKEN_ELSE:
@@ -1279,6 +1325,9 @@ static ASTNode *parse_for_statement(void) {
     if (iterable->type == NODE_BINARY &&
         (iterable->as.binary.op == TOKEN_DOT_DOT ||
          iterable->as.binary.op == TOKEN_DOT_DOT_EQUAL)) {
+        if (has_var2) {
+            error_at(&var2, "Range loops accept exactly one loop variable.");
+        }
         ASTNode *node = ast_alloc(NODE_FOR_RANGE, line);
         node->as.for_range.var = var1;
         node->as.for_range.start = iterable->as.binary.left;

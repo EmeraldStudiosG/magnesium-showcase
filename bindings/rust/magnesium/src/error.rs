@@ -9,6 +9,10 @@ pub enum HostError {
     AllocationFailed { operation: &'static str },
     InvalidFunctionHandle,
     InvalidNativeHandle,
+    ForeignValue,
+    InputTooLong { field: &'static str },
+    InvalidArity { arity: libc::c_int },
+    MissingCallback,
 }
 
 impl fmt::Display for HostError {
@@ -24,6 +28,14 @@ impl fmt::Display for HostError {
                 write!(f, "function handle does not belong to this VM")
             }
             HostError::InvalidNativeHandle => write!(f, "value is not a native handle"),
+            HostError::ForeignValue => write!(f, "object value belongs to a different VM"),
+            HostError::InputTooLong { field } => {
+                write!(f, "{} is too long for the Magnesium C API", field)
+            }
+            HostError::InvalidArity { arity } => {
+                write!(f, "native arity {} is outside the supported range", arity)
+            }
+            HostError::MissingCallback => write!(f, "native callback is missing"),
         }
     }
 }
@@ -163,19 +175,17 @@ pub enum InterpretResult {
 
 impl InterpretResult {
     pub fn from_raw(raw: sys::InterpretResult) -> Self {
-        Self::from_raw_with_vm(raw, std::ptr::null_mut())
+        unsafe { Self::from_raw_with_vm(raw, std::ptr::null_mut()) }
     }
 
-    pub fn from_raw_with_vm(raw: sys::InterpretResult, vm: *mut sys::VM) -> Self {
+    pub unsafe fn from_raw_with_vm(raw: sys::InterpretResult, vm: *mut sys::VM) -> Self {
         match raw {
             sys::InterpretResult::Ok => InterpretResult::Ok,
             sys::InterpretResult::CompileError => {
                 InterpretResult::Err(InterpretError::CompileError)
             }
             sys::InterpretResult::RuntimeError => {
-                InterpretResult::Err(InterpretError::RuntimeError(unsafe {
-                    MgError::from_vm(vm)
-                }))
+                InterpretResult::Err(InterpretError::RuntimeError(MgError::from_vm(vm)))
             }
             sys::InterpretResult::Yield => InterpretResult::Err(InterpretError::Yield),
         }

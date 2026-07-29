@@ -1,5 +1,25 @@
 use magnesium_sys::*;
 
+struct VmGuard(*mut VM);
+
+impl VmGuard {
+    unsafe fn new() -> Self {
+        let vm = vm_new();
+        assert!(!vm.is_null(), "vm_new returned null");
+        Self(vm)
+    }
+
+    fn as_ptr(&self) -> *mut VM {
+        self.0
+    }
+}
+
+impl Drop for VmGuard {
+    fn drop(&mut self) {
+        unsafe { vm_delete(self.0) };
+    }
+}
+
 const QNAN: u64 = 0x7ffc000000000000;
 const SIGN_BIT: u64 = 0x8000000000000000;
 const TAG_NULL: u64 = 1;
@@ -84,56 +104,41 @@ fn as_number(v: Value) -> f64 {
 #[test]
 fn test_vm_init_free() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
-        vm_free(vm);
+        drop(VmGuard::new());
     }
 }
 
 #[test]
 fn test_vm_interpret() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
         let source = std::ffi::CString::new("print(\"hello from sys\")").unwrap();
-        let result = vm_interpret(vm, source.as_ptr());
+        let result = vm_interpret(vm.as_ptr(), source.as_ptr());
         assert_eq!(result, InterpretResult::Ok);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_vm_push_pop() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        vm_push(vm, int_val(42));
-        let v = vm_pop(vm);
+        vm_push(vm.as_ptr(), int_val(42));
+        let v = vm_pop(vm.as_ptr());
         assert!(is_int(v));
         assert_eq!(as_int(v), 42);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_vm_compile() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
         let source = std::ffi::CString::new("let x = 1 + 2").unwrap();
-        let func = vm_compile(vm, source.as_ptr());
+        let func = vm_compile(vm.as_ptr(), source.as_ptr());
         assert!(!func.is_null());
-
-        vm_free(vm);
     }
 }
 
@@ -182,104 +187,93 @@ fn test_value_bits_roundtrip() {
 }
 
 #[test]
+fn test_opcode_discriminants_match_current_c_header() {
+    assert_eq!(OpCode::ForModiAccum as libc::c_int, 62);
+    assert_eq!(OpCode::Addsub as libc::c_int, 102);
+    assert_eq!(OpCode::Mcallfield as libc::c_int, 118);
+    assert_eq!(OpCode::AddiLoop as libc::c_int, 120);
+    assert_eq!(OpCode::Count as libc::c_int, 121);
+}
+
+#[test]
 fn test_copy_string() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
         let s = std::ffi::CString::new("hello").unwrap();
-        let str_obj = copy_string(vm, s.as_ptr(), 5);
+        let str_obj = copy_string(vm.as_ptr(), s.as_ptr(), 5);
         assert!(!str_obj.is_null());
         assert_eq!((*str_obj).length, 5);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_new_array() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        let arr = new_array(vm);
+        let arr = new_array(vm.as_ptr());
         assert!(!arr.is_null());
         assert_eq!((*arr).count, 0);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_array_push_get() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        let arr = new_array(vm);
-        array_push(vm, arr, int_val(10));
-        array_push(vm, arr, int_val(20));
+        let arr = new_array(vm.as_ptr());
+        array_push(vm.as_ptr(), arr, int_val(10));
+        array_push(vm.as_ptr(), arr, int_val(20));
         assert_eq!((*arr).count, 2);
 
         let v0 = array_get(arr, 0);
         let v1 = array_get(arr, 1);
         assert_eq!(as_int(v0), 10);
         assert_eq!(as_int(v1), 20);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_new_dict() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        let dict = new_dict(vm);
+        let dict = new_dict(vm.as_ptr());
         assert!(!dict.is_null());
         assert_eq!((*dict).count, 0);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_dict_set_get() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        let dict = new_dict(vm);
-        let key = copy_string(vm, std::ffi::CString::new("x").unwrap().as_ptr(), 1);
-        dict_set(vm, dict, key, int_val(42));
+        let dict = new_dict(vm.as_ptr());
+        let key = copy_string(
+            vm.as_ptr(),
+            std::ffi::CString::new("x").unwrap().as_ptr(),
+            1,
+        );
+        dict_set(vm.as_ptr(), dict, key, int_val(42));
 
         let mut result: Value = 0;
         let found = dict_get(dict, key, &mut result);
         assert!(found);
         assert_eq!(as_int(result), 42);
-
-        vm_free(vm);
     }
 }
 
 #[test]
 fn test_gc_collect() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
         let source = std::ffi::CString::new("let x = 1 let y = 2").unwrap();
-        vm_interpret(vm, source.as_ptr());
-        gc_collect(vm);
-
-        vm_free(vm);
+        vm_interpret(vm.as_ptr(), source.as_ptr());
+        gc_collect(vm.as_ptr());
     }
 }
 
@@ -289,11 +283,13 @@ fn test_table_api() {
         let mut table: Table = std::mem::zeroed();
         table_init(&mut table);
 
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
-        let key = copy_string(vm, std::ffi::CString::new("test").unwrap().as_ptr(), 4);
+        let key = copy_string(
+            vm.as_ptr(),
+            std::ffi::CString::new("test").unwrap().as_ptr(),
+            4,
+        );
         table_set(&mut table, key, int_val(99));
 
         let mut val: Value = 0;
@@ -302,7 +298,6 @@ fn test_table_api() {
         assert_eq!(as_int(val), 99);
 
         table_free(&mut table);
-        vm_free(vm);
     }
 }
 
@@ -350,15 +345,11 @@ fn test_typecheck_api() {
 #[test]
 fn test_vm_interpret_named() {
     unsafe {
-        let mut vm: std::mem::MaybeUninit<VM> = std::mem::MaybeUninit::uninit();
-        vm_init(vm.as_mut_ptr());
-        let vm = vm.assume_init_mut();
+        let vm = VmGuard::new();
 
         let source = std::ffi::CString::new("let x = 1 + 2 print(x)").unwrap();
         let name = std::ffi::CString::new("<test>").unwrap();
-        let result = vm_interpret_named(vm, source.as_ptr(), name.as_ptr());
+        let result = vm_interpret_named(vm.as_ptr(), source.as_ptr(), name.as_ptr());
         assert_eq!(result, InterpretResult::Ok);
-
-        vm_free(vm);
     }
 }

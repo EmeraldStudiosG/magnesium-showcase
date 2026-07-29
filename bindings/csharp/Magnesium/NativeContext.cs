@@ -23,7 +23,7 @@ namespace Magnesium
         public int? ArgInt(int index) => Arg(index)?.TryAsInt();
         public double? ArgNumber(int index) => Arg(index)?.TryAsNumber();
         public double? ArgNumeric(int index) => Arg(index)?.TryAsNumeric();
-        public string? ArgString(int index) => Arg(index)?.TryAsString();
+        public string? ArgString(int index) => Arg(index)?.TryAsString(Vm);
 
         public Value ExpectArg(int index) =>
             Arg(index) ?? throw new InvalidOperationException($"Argument index {index} out of range");

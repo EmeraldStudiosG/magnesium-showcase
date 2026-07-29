@@ -17,20 +17,23 @@ if ! command -v gcc &>/dev/null && ! command -v cc &>/dev/null; then
     exit 1
 fi
 
+if ! command -v make &>/dev/null; then
+    echo "Error: make is required. Install it first."
+    exit 1
+fi
+
+C_COMPILER="$(command -v gcc || command -v cc)"
+
 echo "Cloning repository..."
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$TMPDIR/magnesium"
 
 echo "Building magnesium..."
-if [ "$(uname -s)" = "Darwin" ]; then
-    make -C "$TMPDIR/magnesium" CC="$(command -v gcc || command -v cc)" CFLAGS="-Wall -Wextra -std=c11 -O3 -Isrc" LDFLAGS="-lm" 2>&1
-else
-    make -C "$TMPDIR/magnesium" 2>&1
-fi
+make -C "$TMPDIR/magnesium" CC="$C_COMPILER" 2>&1
 
 echo "Installing to $PREFIX..."
-make -C "$TMPDIR/magnesium" install PREFIX="$PREFIX" 2>&1
+make -C "$TMPDIR/magnesium" install CC="$C_COMPILER" PREFIX="$PREFIX" 2>&1
 
 # VS Code extension
 if command -v code &>/dev/null && command -v npm &>/dev/null; then

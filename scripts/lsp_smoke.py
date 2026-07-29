@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "magnesium"
-URI = "file:///tmp/magnesium_lsp_smoke.mg"
+default_binary = ROOT / ("magnesium.exe" if os.name == "nt" else "magnesium")
+BIN = Path(os.environ.get("MAGNESIUM_BIN", default_binary))
+URI = (ROOT / "magnesium_lsp_smoke.mg").resolve().as_uri()
+UNICODE_MARKER = "\U0001F9EA"
 
 SOURCE = """let input = input("score")
 if input > 10 then
     print(input)
 end
+print("__UNICODE_MARKER__", input)
 
 type PlayerData = &< name: string, score: number >
 extern fn host_score(): number
@@ -25,7 +29,7 @@ let config = &< port = 8080 >
 print(dict.get(config, "port"))
 print(math.sqrt(4))
 print(add(1, 2))
-"""
+""".replace("__UNICODE_MARKER__", UNICODE_MARKER)
 
 STRICT_BAD_SOURCE = """!strict
 let score: number = "bad"
@@ -35,6 +39,10 @@ score()
 
 def send(proc, payload):
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    send_raw(proc, body)
+
+
+def send_raw(proc, body):
     proc.stdin.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
     proc.stdin.flush()
 
@@ -67,7 +75,15 @@ def position_of(needle):
     before = SOURCE.index(needle)
     line = SOURCE.count("\n", 0, before)
     line_start = SOURCE.rfind("\n", 0, before) + 1
-    return {"line": line, "character": before - line_start}
+    prefix = SOURCE[line_start:before]
+    return {"line": line, "character": len(prefix.encode("utf-16-le")) // 2}
+
+
+def wait_for_diagnostics(proc):
+    while True:
+        msg = read_message(proc)
+        if msg.get("method") == "textDocument/publishDiagnostics":
+            return msg["params"]["diagnostics"]
 
 
 def main():
@@ -81,6 +97,7 @@ def main():
     try:
         init = request(proc, counter, "initialize", {"processId": None, "rootUri": str(ROOT)})
         caps = init["result"]["capabilities"]
+        assert init["result"]["serverInfo"]["version"] == "1.1.0"
         assert "completionProvider" in caps
         assert caps.get("hoverProvider") is True
         assert caps.get("documentSymbolProvider") is True
@@ -106,14 +123,29 @@ def main():
             },
         )
 
-        diagnostics = None
-        while diagnostics is None:
-            msg = read_message(proc)
-            if msg.get("method") == "textDocument/publishDiagnostics":
-                diagnostics = msg["params"]["diagnostics"]
+        diagnostics = wait_for_diagnostics(proc)
         assert diagnostics == [], diagnostics
 
         text_doc = {"uri": URI}
+
+        # Malformed messages must be rejected without reading past their
+        # Content-Length allocation or terminating the server. These cases
+        # end immediately after an escape prefix, including a truncated
+        # surrogate pair.
+        malformed_change_prefix = (
+            b'{"jsonrpc":"2.0","method":"textDocument/didChange","params":'
+            b'{"textDocument":{"uri":'
+            + json.dumps(URI).encode("utf-8")
+            + b'},"contentChanges":[{"text":"'
+        )
+        for escape_suffix in (
+            b"\\",
+            b"\\u12",
+            b"\\uD800",
+            b"\\uD800\\u12",
+        ):
+            send_raw(proc, malformed_change_prefix + escape_suffix)
+
         math_dot = position_of("math.sqrt")
         math_dot["character"] += len("math.")
         completion = request(proc, counter, "textDocument/completion", {
@@ -129,6 +161,17 @@ def main():
             "position": hover_pos,
         })
         assert "print" in hover["result"]["contents"]["value"]
+
+        unicode_hover_pos = position_of(f'print("{UNICODE_MARKER}", input)')
+        unicode_prefix = f'print("{UNICODE_MARKER}", '
+        unicode_hover_pos["character"] += len(unicode_prefix.encode("utf-16-le")) // 2
+        unicode_hover = request(proc, counter, "textDocument/hover", {
+            "textDocument": text_doc,
+            "position": unicode_hover_pos,
+        })
+        assert unicode_hover["result"]["range"]["start"]["character"] == (
+            len(unicode_prefix.encode("utf-16-le")) // 2
+        )
 
         symbols = request(proc, counter, "textDocument/documentSymbol", {"textDocument": text_doc})
         symbol_names = [item["name"] for item in symbols["result"]]
@@ -176,14 +219,47 @@ def main():
                 },
             },
         )
-        strict_diagnostics = None
-        while strict_diagnostics is None:
-            msg = read_message(proc)
-            if msg.get("method") == "textDocument/publishDiagnostics":
-                strict_diagnostics = msg["params"]["diagnostics"]
+        strict_diagnostics = wait_for_diagnostics(proc)
         strict_messages = [d["message"] for d in strict_diagnostics]
         assert any("Expected number" in m for m in strict_messages), strict_messages
         assert any("Cannot call number" in m for m in strict_messages), strict_messages
+
+        # Regression coverage for response builders that used to truncate or
+        # advance past fixed-size buffers on sufficiently large documents.
+        large_source = "\n".join(f"let value_{i} = {i}" for i in range(7000)) + "\n"
+        send(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": URI, "version": 3},
+                    "contentChanges": [{"text": large_source}],
+                },
+            },
+        )
+        wait_for_diagnostics(proc)
+        semantic = request(
+            proc,
+            counter,
+            "textDocument/semanticTokens/full",
+            {"textDocument": text_doc},
+        )
+        assert len(semantic["result"]["data"]) >= 7000
+        symbols = request(
+            proc,
+            counter,
+            "textDocument/documentSymbol",
+            {"textDocument": text_doc},
+        )
+        assert len(symbols["result"]) == 7000
+        formatting = request(
+            proc,
+            counter,
+            "textDocument/formatting",
+            {"textDocument": text_doc, "options": {"tabSize": 4, "insertSpaces": True}},
+        )
+        assert formatting["result"][0]["newText"].count("\n") == 7000
 
         shutdown = request(proc, counter, "shutdown", None)
         assert shutdown["result"] is None

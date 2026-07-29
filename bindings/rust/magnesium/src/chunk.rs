@@ -51,14 +51,14 @@ pub fn chunk_init(chunk: &mut sys::Chunk) {
     unsafe { sys::chunk_init(chunk) };
 }
 
-pub fn chunk_free(chunk: &mut sys::Chunk) {
-    unsafe { sys::chunk_free(chunk) };
+pub unsafe fn chunk_free(chunk: &mut sys::Chunk) {
+    sys::chunk_free(chunk);
 }
 
-pub fn chunk_write(chunk: &mut sys::Chunk, inst: sys::Instruction, line: libc::c_int) {
-    unsafe { sys::chunk_write(chunk, inst, line) };
+pub unsafe fn chunk_write(chunk: &mut sys::Chunk, inst: sys::Instruction, line: libc::c_int) {
+    sys::chunk_write(chunk, inst, line);
 }
 
-pub fn chunk_add_constant(chunk: &mut sys::Chunk, value: Value) -> libc::c_int {
-    unsafe { sys::chunk_add_constant(chunk, value.to_raw()) }
+pub unsafe fn chunk_add_constant(chunk: &mut sys::Chunk, value: &Value) -> libc::c_int {
+    sys::chunk_add_constant(chunk, value.raw_ref())
 }

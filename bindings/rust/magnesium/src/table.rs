@@ -32,9 +32,9 @@ impl MgTable {
         self.0.count == 0
     }
 
-    pub fn get(&self, key: &MgString) -> Option<Value> {
+    pub unsafe fn get(&self, key: &MgString) -> Option<Value> {
         let mut value: sys::Value = 0;
-        let found = unsafe { sys::table_get(&self.0 as *const _ as *mut _, key.raw(), &mut value) };
+        let found = sys::table_get(&self.0 as *const _ as *mut _, key.raw(), &mut value);
         if found {
             Some(Value::from_raw(value))
         } else {
@@ -42,34 +42,28 @@ impl MgTable {
         }
     }
 
-    pub fn set(&mut self, key: &MgString, value: Value) -> bool {
-        unsafe { sys::table_set(&mut self.0, key.raw(), value.to_raw()) }
+    pub unsafe fn set(&mut self, key: &MgString, value: &Value) -> bool {
+        sys::table_set(&mut self.0, key.raw(), value.raw_ref())
     }
 
-    pub fn delete(&mut self, key: &MgString) -> bool {
-        unsafe { sys::table_delete(&mut self.0, key.raw()) }
+    pub unsafe fn delete(&mut self, key: &MgString) -> bool {
+        sys::table_delete(&mut self.0, key.raw())
     }
 
-    pub fn find_string(&self, chars: &str) -> Option<MgString> {
-        let c_str = std::ffi::CString::new(chars).expect("string contains null byte");
+    pub unsafe fn find_string(&self, chars: &str) -> Option<MgString> {
+        let length = libc::c_int::try_from(chars.len()).ok()?;
         let mut hash: u32 = 2166136261;
         for b in chars.as_bytes() {
             hash ^= *b as u32;
             hash = hash.wrapping_mul(16777619);
         }
-        let key = unsafe {
-            sys::table_find_string(
-                &self.0 as *const _ as *mut _,
-                c_str.as_ptr(),
-                chars.len() as libc::c_int,
-                hash,
-            )
-        };
-        if key.is_null() {
-            None
-        } else {
-            Some(MgString(key))
-        }
+        let key = sys::table_find_string(
+            &self.0 as *const _ as *mut _,
+            chars.as_ptr().cast(),
+            length,
+            hash,
+        );
+        MgString::from_raw(key)
     }
 }
 

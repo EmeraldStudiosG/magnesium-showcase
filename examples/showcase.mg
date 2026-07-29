@@ -1,5 +1,5 @@
 // ============================================
-// Magnesium v1.0: Feature Showcase
+// Magnesium v1.1: Feature Showcase
 // ============================================
 
 // --- Variables ---

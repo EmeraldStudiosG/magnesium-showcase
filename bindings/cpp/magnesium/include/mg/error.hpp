@@ -5,10 +5,8 @@
 #include <cstring>
 #include <variant>
 #include <optional>
-
-extern "C" {
-#include "magnesium.h"
-}
+#include <utility>
+#include <mg/value.hpp>
 
 namespace mg {
 
@@ -47,33 +45,63 @@ private:
 
 class MgError {
 public:
-    explicit MgError(::ObjError* raw) : raw_(raw) {}
+    explicit MgError(const ::ObjError* raw) : MgError(nullptr, raw) {}
 
-    ::ObjError* raw() const { return raw_; }
+    MgError(::VM* vm, const ::ObjError* raw)
+        : kind_(snapshot_string(vm, raw ? raw->kind : nullptr)),
+          message_(snapshot_string(vm, raw ? raw->message : nullptr)),
+          file_(snapshot_string(vm, raw ? raw->file : nullptr)),
+          line_(raw ? raw->line : 0),
+          function_(snapshot_string(vm, raw ? raw->function : nullptr)),
+          hint_(snapshot_string(vm, raw ? raw->hint : nullptr)) {}
 
-    std::string kind() const {
-        return raw_->kind ? std::string(raw_->kind->chars, raw_->kind->length) : "";
-    }
-    std::string message() const {
-        return raw_->message ? std::string(raw_->message->chars, raw_->message->length) : "";
-    }
-    std::string file() const {
-        return raw_->file ? std::string(raw_->file->chars, raw_->file->length) : "";
-    }
-    int line() const { return raw_->line; }
-    std::string function() const {
-        return raw_->function ? std::string(raw_->function->chars, raw_->function->length) : "";
-    }
-    std::string hint() const {
-        return raw_->hint ? std::string(raw_->hint->chars, raw_->hint->length) : "";
-    }
+    MgError(std::string kind, std::string message, std::string file,
+            int line, std::string function, std::string hint)
+        : kind_(std::move(kind)),
+          message_(std::move(message)),
+          file_(std::move(file)),
+          line_(line),
+          function_(std::move(function)),
+          hint_(std::move(hint)) {}
+
+    std::string kind() const { return kind_; }
+    std::string message() const { return message_; }
+    std::string file() const { return file_; }
+    int line() const { return line_; }
+    std::string function() const { return function_; }
+    std::string hint() const { return hint_; }
 
     std::string to_string() const {
         return "[" + kind() + ":" + std::to_string(line()) + "] " + message();
     }
 
 private:
-    ::ObjError* raw_;
+    static std::string snapshot_string(::VM* vm, ::ObjString* raw) {
+        if (!raw || raw->length < 0) return "";
+        if (vm) {
+            size_t required = 0;
+            ::Value value = Value::obj_val(raw).to_raw();
+            vm_string_copy(vm, value, nullptr, 0, &required);
+            if (required > 0) {
+                std::string copy(required, '\0');
+                if (vm_string_copy(vm, value, copy.data(), copy.size(), nullptr)) {
+                    copy.resize(required - 1);
+                    return copy;
+                }
+            }
+        }
+        if (!raw->is_rope && raw->chars) {
+            return std::string(raw->chars, static_cast<size_t>(raw->length));
+        }
+        return "";
+    }
+
+    std::string kind_;
+    std::string message_;
+    std::string file_;
+    int line_;
+    std::string function_;
+    std::string hint_;
 };
 
 enum class InterpretErrorKind {
@@ -130,11 +158,25 @@ public:
     }
 
     static InterpretResult from_raw_with_vm(::InterpretResult raw, ::VM* vm) {
-        if (raw == ::InterpretResult::INTERPRET_RUNTIME_ERROR && vm) {
-            auto* err_obj = reinterpret_cast<::ObjError*>(vm->stack[vm->stack_top - 1]);
-            if (err_obj && err_obj->obj.type == OBJ_ERROR) {
-                return InterpretResult(InterpretError(InterpretErrorKind::RuntimeError, MgError(err_obj)));
+        ::Value raw_error = Value::null().to_raw();
+        if (raw == ::InterpretResult::INTERPRET_RUNTIME_ERROR &&
+                vm_last_error_value(vm, &raw_error)) {
+            Value error_value = Value::from_raw(raw_error);
+            if (error_value.is_error()) {
+                auto* err_obj = reinterpret_cast<::ObjError*>(error_value.as_obj());
+                return InterpretResult(InterpretError(
+                    InterpretErrorKind::RuntimeError, MgError(vm, err_obj)));
             }
+        }
+        if (raw == ::InterpretResult::INTERPRET_RUNTIME_ERROR && vm) {
+            return InterpretResult(InterpretError(
+                InterpretErrorKind::RuntimeError,
+                MgError("RuntimeError",
+                        vm_last_error(vm),
+                        vm_last_error_file(vm),
+                        vm_last_error_line(vm),
+                        vm_last_error_function(vm),
+                        "")));
         }
         return from_raw(raw);
     }

@@ -216,6 +216,49 @@ static void test_runtime_errors_preserve_message() {
     assert(vm.last_error_line() > 0);
 }
 
+static void test_runtime_error_snapshot_outlives_vm() {
+    std::optional<mg::MgError> snapshot;
+    std::string expected_kind;
+    std::string expected_message;
+    std::string expected_file;
+    std::string expected_function;
+    std::string expected_hint;
+    int expected_line = 0;
+
+    {
+        mg::Vm vm;
+        auto result = vm.interpret("let snapshot_failure = \"a\" + 1");
+        assert(result.is_err());
+        assert(result.error().kind() == mg::InterpretErrorKind::RuntimeError);
+        assert(result.error().mg_error().has_value());
+
+        snapshot = *result.error().mg_error();
+        expected_kind = snapshot->kind();
+        expected_message = snapshot->message();
+        expected_file = snapshot->file();
+        expected_line = snapshot->line();
+        expected_function = snapshot->function();
+        expected_hint = snapshot->hint();
+        assert(!expected_message.empty());
+
+        vm.clear_error();
+        for (int i = 0; i < 128; i++) {
+            vm.set_global_string(
+                "snapshot_churn_" + std::to_string(i),
+                std::string(128, static_cast<char>('a' + (i % 26))));
+        }
+        mg::gc_collect(vm);
+    }
+
+    assert(snapshot.has_value());
+    assert(snapshot->kind() == expected_kind);
+    assert(snapshot->message() == expected_message);
+    assert(snapshot->file() == expected_file);
+    assert(snapshot->line() == expected_line);
+    assert(snapshot->function() == expected_function);
+    assert(snapshot->hint() == expected_hint);
+}
+
 static std::atomic<bool> finalizer_called{false};
 
 struct Counter {
@@ -384,6 +427,94 @@ static void test_vm_move() {
     assert(v->as_int() == 10);
 }
 
+static void test_vm_move_rebinds_native_callbacks() {
+    mg::Vm vm1;
+    vm1.register_native_fn("answer", 0, [](mg::NativeContext&) {
+        return mg::Value::int_val(42);
+    });
+
+    mg::Vm vm2 = std::move(vm1);
+    auto result = vm2.interpret("let moved_answer = answer()\nprint(moved_answer)");
+    assert(result.is_ok());
+}
+
+static void test_native_exception_is_contained() {
+    mg::Vm vm;
+    vm.register_native_fn("managed_failure", 0, [](mg::NativeContext&) -> mg::Value {
+        throw std::runtime_error("expected C++ callback failure");
+    });
+    auto result = vm.interpret("managed_failure()");
+    assert(result.is_err());
+    assert(vm.last_error_message().find("expected C++ callback failure") != std::string::npos);
+}
+
+static void test_gc_roots_are_not_lifo() {
+    mg::Vm vm;
+    auto first = vm.new_array_value();
+    auto second = vm.new_array_value();
+    auto first_root = std::make_unique<mg::GcRoot>(vm, first);
+    auto second_root = std::make_unique<mg::GcRoot>(vm, second);
+
+    first_root.reset();
+    mg::gc_collect(vm);
+    assert(second_root->get().is_array());
+
+    mg::Vm moved = std::move(vm);
+    mg::gc_collect(moved);
+    assert(second_root->get().is_array());
+    second_root.reset();
+}
+
+static void test_gc_root_can_outlive_vm() {
+    std::unique_ptr<mg::GcRoot> root;
+    {
+        mg::Vm vm;
+        root = std::make_unique<mg::GcRoot>(vm, vm.new_array_value());
+        assert(root->get().is_array());
+    }
+
+    assert(root->get().is_null());
+    assert(!root->set(mg::Value::int_val(1)));
+    root.reset();
+}
+
+static void test_gc_roots_follow_vm_move_assignment() {
+    mg::Vm source;
+    auto source_root = std::make_unique<mg::GcRoot>(
+        source, source.new_array_value());
+
+    mg::Vm destination;
+    auto old_destination_root = std::make_unique<mg::GcRoot>(
+        destination, destination.new_array_value());
+
+    destination = std::move(source);
+    mg::gc_collect(destination);
+
+    assert(source_root->get().is_array());
+    assert(old_destination_root->get().is_null());
+    assert(!old_destination_root->set(mg::Value::int_val(1)));
+}
+
+static void test_collection_mutators_report_success() {
+    mg::Vm vm;
+    auto array_value = vm.new_array_value();
+    mg::GcRoot array_root(vm, array_value);
+    mg::MgArray array(reinterpret_cast<::ObjArray*>(array_value.as_obj()));
+    array.push(vm, mg::Value::int_val(1));
+    assert(array.set(vm, 0, mg::Value::int_val(2)));
+    assert(array.get(0)->as_int() == 2);
+
+    auto dict_value = vm.new_dict_value();
+    mg::GcRoot dict_root(vm, dict_value);
+    auto* key_raw = copy_string(vm.raw_mut(), "key", 3);
+    mg::GcRoot key_root(vm, mg::Value::obj_val(key_raw));
+    mg::MgDict dict(reinterpret_cast<::ObjDict*>(dict_value.as_obj()));
+    mg::MgString key(key_raw);
+    assert(dict.set(vm, key, mg::Value::int_val(1)));
+    assert(dict.set(vm, key, mg::Value::int_val(2)));
+    assert(dict.get(key)->as_int() == 2);
+}
+
 static void test_new_array_value() {
     mg::Vm vm;
     auto arr = vm.new_array_value();
@@ -474,6 +605,7 @@ static TestEntry tests[] = {
     {"value_equality", test_value_equality},
     {"safe_numeric_ffi_registration", test_safe_numeric_ffi_registration},
     {"runtime_errors_preserve_message", test_runtime_errors_preserve_message},
+    {"runtime_error_snapshot_outlives_vm", test_runtime_error_snapshot_outlives_vm},
     {"native_handle_method_and_finalizer", test_native_handle_method_and_finalizer},
     {"native_handle_closure_method", test_native_handle_closure_method},
     {"register_native_fn", test_register_native_fn},
@@ -485,6 +617,12 @@ static TestEntry tests[] = {
     {"native_fn_no_args", test_native_fn_no_args},
     {"native_fn_access_vm", test_native_fn_access_vm},
     {"vm_move", test_vm_move},
+    {"vm_move_rebinds_native_callbacks", test_vm_move_rebinds_native_callbacks},
+    {"native_exception_is_contained", test_native_exception_is_contained},
+    {"gc_roots_are_not_lifo", test_gc_roots_are_not_lifo},
+    {"gc_root_can_outlive_vm", test_gc_root_can_outlive_vm},
+    {"gc_roots_follow_vm_move_assignment", test_gc_roots_follow_vm_move_assignment},
+    {"collection_mutators_report_success", test_collection_mutators_report_success},
     {"new_array_value", test_new_array_value},
     {"new_dict_value", test_new_dict_value},
     {"set_global_number_and_bool", test_set_global_number_and_bool},

@@ -10,17 +10,36 @@ fn repo_root() -> &'static Path {
         .unwrap()
         .parent()
         .unwrap()
+        .parent()
+        .unwrap()
 }
 
-fn read_expected(test_name: &str) -> Option<String> {
+fn read_expected(test_name: &str) -> String {
     let path = repo_root()
         .join("tests/expected")
         .join(format!("{}.expected", test_name));
-    fs::read_to_string(&path).ok()
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {}", path.display(), error))
+}
+
+fn normalize_output(output: &str) -> String {
+    output
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end()
+        .to_string()
 }
 
 fn run_mg_binary(test_name: &str) -> (String, bool) {
-    let binary = repo_root().join("magnesium");
+    let binary = std::env::var_os("MAGNESIUM_BIN")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root().join(if cfg!(windows) {
+                "magnesium.exe"
+            } else {
+                "magnesium"
+            })
+        });
     let relative_path = format!("tests/{}.mg", test_name);
     let output = Command::new(binary)
         .args([&relative_path])
@@ -37,21 +56,13 @@ fn run_mg_binary(test_name: &str) -> (String, bool) {
         format!("{}\n{}", stdout, stderr.trim_end_matches('\n'))
     };
     let success = output.status.success();
-    (combined.trim_end().to_string(), success)
+    (normalize_output(&combined), success)
 }
 
 fn check_binary_test(test_name: &str) {
-    let expected = match read_expected(test_name) {
-        Some(e) => e,
-        None => return,
-    };
+    let expected = normalize_output(&read_expected(test_name));
     let (actual, _) = run_mg_binary(test_name);
-    assert_eq!(
-        actual.trim_end(),
-        expected.trim_end(),
-        "output mismatch for {}",
-        test_name
-    );
+    assert_eq!(actual, expected, "output mismatch for {}", test_name);
 }
 
 macro_rules! mg_binary_test {
@@ -132,7 +143,7 @@ fn test_native_fn_from_mg() {
     }
 
     let mut vm = Vm::new();
-    vm.register_native("rust_add", Some(rust_add), 2);
+    unsafe { vm.register_native("rust_add", Some(rust_add), 2) };
     let val = vm.get_global("rust_add");
     assert!(
         val.is_some(),

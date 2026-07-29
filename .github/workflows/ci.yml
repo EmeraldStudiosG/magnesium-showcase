@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux tests and benchmark gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install benchmark runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes lua5.4 perl
+
+      - name: Run tests
+        run: make test
+
+      - name: Run benchmark release gate
+        env:
+          RUNS: "5"
+          WARMUPS: "1"
+          BENCH_TIMEOUT: "120"
+          REQUIRE_ALL_RUNTIMES: "1"
+          PERFORMANCE_GATE: "1"
+        run: bash scripts/run_bench.sh
+
+  windows:
+    name: Windows tests and benchmark gate
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Magnesium
+        shell: pwsh
+        run: |
+          $runtimeSources = @(
+            "src/lexer.c",
+            "src/parser.c",
+            "src/compiler.c",
+            "src/typecheck.c",
+            "src/object.c",
+            "src/gc.c",
+            "src/vm.c",
+            "src/serialize.c",
+            "src/lsp.c",
+            "src/mg_ffi_glue.c"
+          )
+          $sources = @("src/main.c") + $runtimeSources[0..8]
+          & clang -Wall -Wextra -std=c11 -O3 -Isrc `
+            -D_CRT_SECURE_NO_WARNINGS @sources -o magnesium.exe `
+            -lws2_32
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & clang -Wall -Wextra -std=c11 -O3 -Isrc `
+            -D_CRT_SECURE_NO_WARNINGS tests/test_runtime_api.c `
+            @runtimeSources -o tests/test_runtime_api.exe -lws2_32
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build Lua 5.4
+        shell: pwsh
+        run: |
+          $luaVersion = "5.4.8"
+          $luaRoot = Join-Path $env:RUNNER_TEMP "lua-$luaVersion"
+          $archive = Join-Path $env:RUNNER_TEMP "lua-$luaVersion.tar.gz"
+          Invoke-WebRequest `
+            -Uri "https://www.lua.org/ftp/lua-$luaVersion.tar.gz" `
+            -OutFile $archive
+          $expectedSha256 = `
+            "4F18DDAE154E793E46EEAB727C59EF1C0C0C2B744E7B94219710D76F530629AE"
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Unexpected Lua source checksum: $actualSha256"
+          }
+          tar -xzf $archive -C $env:RUNNER_TEMP
+          $sourceRoot = Join-Path $luaRoot "src"
+          $librarySources = @(
+            Get-ChildItem $sourceRoot -Filter "*.c" |
+              Where-Object { $_.Name -notin @("lua.c", "luac.c", "onelua.c") } |
+              ForEach-Object { $_.FullName }
+          )
+          $lua = Join-Path $luaRoot "lua54.exe"
+          $luac = Join-Path $luaRoot "luac54.exe"
+          & clang -O2 -std=c11 -D_CRT_SECURE_NO_WARNINGS -DLUA_USE_WINDOWS `
+            -I $sourceRoot @librarySources `
+            (Join-Path $sourceRoot "lua.c") -o $lua
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & clang -O2 -std=c11 -D_CRT_SECURE_NO_WARNINGS -DLUA_USE_WINDOWS `
+            -I $sourceRoot @librarySources `
+            (Join-Path $sourceRoot "luac.c") -o $luac
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $lua -v
+          & $luac -v
+          "LUA=$lua" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LUAC=$luac" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Run source tests
+        shell: powershell
+        run: .\scripts\run_tests.ps1
+
+      - name: Run native API tests
+        shell: powershell
+        run: .\tests\test_runtime_api.exe
+
+      - name: Run bytecode tests
+        shell: powershell
+        run: |
+          $env:PYTHON = (Get-Command python.exe).Source
+          .\scripts\run_bytecode_tests.ps1
+
+      - name: Run benchmark release gate
+        shell: powershell
+        env:
+          RUNS: "5"
+          WARMUPS: "1"
+          BENCH_TIMEOUT: "120"
+          REQUIRE_ALL_RUNTIMES: "1"
+          PERFORMANCE_GATE: "1"
+        run: |
+          $env:PYTHON = (Get-Command python.exe).Source
+          .\scripts\run_bench.ps1

@@ -1,6 +1,5 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() {
     let vendored = env::var("CARGO_FEATURE_VENDORED").is_ok();
@@ -27,23 +26,15 @@ fn build_repo_root(repo_root: PathBuf) {
         repo_root
     );
 
-    let status = Command::new("make")
-        .args(["-C", repo_root.to_str().unwrap(), "lib"])
-        .status()
-        .expect("failed to run `make lib` - is `make` installed?");
-    if !status.success() {
-        panic!("`make lib` failed");
-    }
-
-    println!("cargo:rustc-link-search=native={}", repo_root.display());
-    println!("cargo:rustc-link-lib=magnesium");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", repo_root.display());
-
-    emit_rerun_if_changed(&repo_root);
+    build_sources(&repo_root);
 }
 
 fn build_vendored() {
     let repo_root = find_repo_root();
+    build_sources(&repo_root);
+}
+
+fn build_sources(repo_root: &std::path::Path) {
     let src_dir = repo_root.join("src");
 
     let lib_src = [
@@ -55,22 +46,26 @@ fn build_vendored() {
         "gc.c",
         "vm.c",
         "serialize.c",
-        "lsp.c",
         "mg_ffi_glue.c",
     ];
 
     let mut build = cc::Build::new();
-    build
-        .warnings(false)
-        .opt_level(3)
-        .flag("-std=c11")
-        .include(&src_dir);
+    build.warnings(false).opt_level(3).include(&src_dir);
 
-    if cfg!(target_os = "linux") {
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if target_env == "msvc" {
+        build.flag("/std:c11").flag("/experimental:c11atomics");
+    } else {
+        build.flag("-std=c11");
+    }
+
+    if target_os == "linux" {
         build.define("_GNU_SOURCE", None).flag("-pthread");
-    } else if cfg!(target_os = "windows") {
+    } else if target_os == "windows" {
         build.define("_CRT_SECURE_NO_WARNINGS", None);
-    } else if cfg!(target_os = "macos") {
+    } else if target_os == "macos" {
         build.flag("-pthread");
     }
 
@@ -86,16 +81,18 @@ fn build_vendored() {
 
     build.compile("magnesium");
 
-    if cfg!(unix) {
+    if target_os != "windows" {
         println!("cargo:rustc-link-lib=m");
-        println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=pthread");
     }
-    if cfg!(target_os = "windows") {
+    if target_os != "windows" && target_os != "macos" {
+        println!("cargo:rustc-link-lib=dl");
+    }
+    if target_os == "windows" {
         println!("cargo:rustc-link-lib=ws2_32");
     }
 
-    emit_rerun_if_changed(&repo_root);
+    emit_rerun_if_changed(repo_root);
 }
 
 fn build_system() {
@@ -103,17 +100,20 @@ fn build_system() {
         "magnesium-sys: `system` feature enabled but libmagnesium not found via pkg-config.\n\
              Install Magnesium first: `sudo make install` (from the Magnesium repo root).",
     );
+    let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
 
     for path in &lib.include_paths {
         println!("cargo:include={}", path.display());
     }
 
-    for path in &lib.link_paths {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
+    if target_family == "unix" {
+        for path in &lib.link_paths {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path.display());
+        }
     }
 }
 
-fn emit_rerun_if_changed(repo_root: &PathBuf) {
+fn emit_rerun_if_changed(repo_root: &std::path::Path) {
     println!(
         "cargo:rerun-if-changed={}",
         repo_root.join("src/magnesium.h").display()

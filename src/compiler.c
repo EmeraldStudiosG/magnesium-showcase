@@ -68,8 +68,6 @@ typedef struct {
     int depth;       /* scope depth */
     bool is_const;
     bool is_captured; /* captured by a closure? */
-    bool has_known_struct;
-    Token known_struct;
 } Local;
 
 typedef struct {
@@ -94,14 +92,6 @@ typedef struct {
     int binding_reg;
 } InlineCandidate;
 
-typedef struct {
-    Token struct_name;
-    Token method_name;
-    Token field_names[2];
-    int param_indices[2];
-    int update_count;
-} FieldLoopCandidate;
-
 typedef struct Compiler Compiler;
 typedef struct {
     int offset;
@@ -111,6 +101,7 @@ typedef struct {
 struct Compiler {
     Compiler *enclosing;
     ObjFunction *function;
+    VMRoot *function_root;
     FunctionType type;
     VM *vm;
 
@@ -119,6 +110,7 @@ struct Compiler {
     int scope_depth;
     int next_reg;        /* next free register */
     int max_reg;         /* high watermark */
+    bool register_overflow_reported;
 
     UpvalueInfo upvalues[MAX_UPVALUES];
 
@@ -135,9 +127,6 @@ struct Compiler {
     InlineCandidate *inline_candidates;
     int inline_count;
     int inline_capacity;
-    FieldLoopCandidate *field_loop_candidates;
-    int field_loop_count;
-    int field_loop_capacity;
     char **owned_strings;
     int owned_string_count;
     int owned_string_capacity;
@@ -147,11 +136,13 @@ struct Compiler {
 
     /* Loop state for break/continue */
     int loop_start;      /* instruction offset of loop top */
+    int loop_scope_depth;/* scope depth to restore on break/continue */
     int *break_jumps;    /* patch list for break statements */
     int break_count;
     int break_capacity;
 
     int error_handler_reg;
+    int error_handler_depth;
     int *error_jumps;
     int error_jump_count;
     int error_jump_capacity;
@@ -176,8 +167,14 @@ static int alloc_reg(void) {
     if (current->next_reg > current->max_reg)
         current->max_reg = current->next_reg;
     if (r >= MAX_REGISTERS) {
-        fprintf(stderr, "Too many registers needed.\n");
-        exit(1);
+        if (!current->register_overflow_reported) {
+            fprintf(stderr, "Error: Too many registers needed (maximum is %d).\n",
+                    MAX_REGISTERS);
+            current->register_overflow_reported = true;
+        }
+        current->had_error = true;
+        current->next_reg = MAX_REGISTERS;
+        return MAX_REGISTERS - 1;
     }
     return r;
 }
@@ -197,8 +194,13 @@ static void free_temp(int reg) {
 
 static void reserve_reg_index(int reg) {
     if (reg >= MAX_REGISTERS) {
-        fprintf(stderr, "Too many registers needed.\n");
-        exit(1);
+        if (!current->register_overflow_reported) {
+            fprintf(stderr, "Error: Too many registers needed (maximum is %d).\n",
+                    MAX_REGISTERS);
+            current->register_overflow_reported = true;
+        }
+        current->had_error = true;
+        return;
     }
     if (reg + 1 > current->max_reg) {
         current->max_reg = reg + 1;
@@ -220,6 +222,17 @@ static void error_at(Token *token, const char *message) {
     }
 
     fprintf(stderr, ": %s\n", message);
+}
+
+static int u8_constant_or_error(int constant, int line, const char *context) {
+    if (constant >= 0 && constant <= UINT8_MAX) return constant;
+    Token token = {TOKEN_ERROR, "", 0, line};
+    char message[160];
+    snprintf(message, sizeof(message),
+             "Too many constants before %s; this bytecode operand supports at most 256 constants.",
+             context);
+    error_at(&token, message);
+    return 0;
 }
 
 static int emit_jump(OpCode op, int line) {
@@ -266,7 +279,21 @@ static void patch_asbx_jump(int offset) {
 }
 
 static int make_constant(Value value) {
-    return chunk_add_constant(current_chunk(), value);
+    /*
+     * Keep a newly-created object alive until it is owned by the active
+     * function.  This also covers imported module functions, whose own
+     * compiler root has already been released when they are returned here.
+     */
+    vm_push(current->vm, value);
+    int constant = chunk_add_constant(current_chunk(), value);
+    /*
+     * A compiler function can be promoted while a large source is still being
+     * compiled.  Host-rooting keeps the function itself alive, while this
+     * barrier keeps constants appended after promotion alive across minor GC.
+     */
+    gc_write_barrier(current->vm, (Obj *)current->function, value);
+    vm_pop(current->vm);
+    return constant;
 }
 
 static int string_constant(VM *vm, const char *chars, int length) {
@@ -284,6 +311,7 @@ static void compile_stmt(ASTNode *node);
 static void compile_block(ASTNode *node);
 static int compile_try_block(ASTNode *node);
 static void compile_try_catch(ASTNode *node);
+static void compile_propagate_error(int err_reg, int line);
 static void add_error_jump(int offset);
 static ObjFunction *compile_with_options(VM *vm, ASTNode *ast,
                                          bool module_mode,
@@ -310,12 +338,16 @@ static void end_scope(int line) {
         close_from--;
     }
 
-    /* Execute defers for this scope in LIFO order */
+    /* Execute defers for this scope in LIFO order.  Their result registers are
+       temporary to the cleanup path and must not keep the lexical scope's
+       registers reserved afterward. */
+    int cleanup_next_reg = current->next_reg;
     for (int i = current->defer_count - 1; i >= 0; i--) {
         if (current->defers[i].depth == current->scope_depth) {
             compile_node(current->defers[i].expr);
         }
     }
+    current->next_reg = cleanup_next_reg;
     /* Remove all defers at this depth */
     {
         int write = 0;
@@ -338,9 +370,32 @@ static void end_scope(int line) {
     }
 }
 
+/*
+ * Emit the runtime work needed when control leaves lexical scopes without
+ * flowing through their normal end_scope() instruction sequence.
+ * This does not mutate compiler bookkeeping because the normal path still
+ * needs its own cleanup instructions.
+ */
+static void emit_scope_exit_cleanup(int target_depth, int line) {
+    int cleanup_next_reg = current->next_reg;
+    for (int i = current->local_count - 1; i >= 0; i--) {
+        Local *local = &current->locals[i];
+        if (local->depth <= target_depth) break;
+        if (local->is_captured) {
+            emit(ENCODE_ABx(OP_CLOSE_UPVAL, local->reg, 0), line);
+        }
+    }
+    for (int i = current->defer_count - 1; i >= 0; i--) {
+        if (current->defers[i].depth > target_depth) {
+            compile_node(current->defers[i].expr);
+        }
+    }
+    current->next_reg = cleanup_next_reg;
+}
+
 static Local *add_local(Token name, int reg, bool is_const) {
     if (current->local_count >= MAX_LOCALS) {
-        fprintf(stderr, "Too many local variables.\n");
+        error_at(&name, "Too many local variables in one function.");
         return NULL;
     }
     Local *local = &current->locals[current->local_count++];
@@ -349,8 +404,6 @@ static Local *add_local(Token name, int reg, bool is_const) {
     local->depth = current->scope_depth;
     local->is_const = is_const;
     local->is_captured = false;
-    local->has_known_struct = false;
-    local->known_struct = (Token){0};
     return local;
 }
 
@@ -376,7 +429,27 @@ static void add_global_str(ObjString* name) {
         root->global_capacity = root->global_capacity < 16 ? 16 : root->global_capacity * 2;
         root->globals = realloc(root->globals, sizeof(ObjString*) * root->global_capacity);
     }
+    /*
+     * The compiler's analysis tables are ordinary C allocations and are not
+     * visited by GC. Keep every unique name on the VM stack for the lifetime
+     * of the root compiler.
+     */
+    vm_push(root->vm, OBJ_VAL(name));
     root->globals[root->global_count++] = name;
+}
+
+static void release_compiler_globals(Compiler *compiler) {
+    for (int i = compiler->global_count - 1; i >= 0; i--) {
+        Value rooted = vm_pop(compiler->vm);
+        if (rooted != OBJ_VAL(compiler->globals[i])) {
+            fprintf(stderr, "Compiler global-root stack became unbalanced.\n");
+            exit(1);
+        }
+    }
+    free(compiler->globals);
+    compiler->globals = NULL;
+    compiler->global_count = 0;
+    compiler->global_capacity = 0;
 }
 
 static void add_global(Token name) {
@@ -452,17 +525,6 @@ static Local *resolve_local_entry(Compiler *compiler, Token *name) {
     return NULL;
 }
 
-static void update_known_struct_for_local(Token *name, ASTNode *value) {
-    Local *local = resolve_local_entry(current, name);
-    if (!local || local->reg < 0) return;
-    local->has_known_struct = false;
-    local->known_struct = (Token){0};
-    if (value && value->type == NODE_STRUCT_LITERAL) {
-        local->has_known_struct = true;
-        local->known_struct = value->as.struct_literal.name;
-    }
-}
-
 static bool is_push_name(Token *name) {
     return name->length == 4 && memcmp(name->start, "push", 4) == 0;
 }
@@ -504,7 +566,8 @@ static int add_upvalue(Compiler *compiler, int index, bool is_local) {
         }
     }
     if (count >= MAX_UPVALUES) {
-        fprintf(stderr, "Too many upvalues in function.\n");
+        Token token = {TOKEN_ERROR, "", 0, 0};
+        error_at(&token, "Too many captured variables in one function.");
         return 0;
     }
     compiler->upvalues[count].index = index;
@@ -516,10 +579,10 @@ static int resolve_upvalue(Compiler *compiler, Token *name) {
     if (!compiler->enclosing) return -1;
 
     /* Check enclosing locals */
-    int local = resolve_local(compiler->enclosing, name);
-    if (local != -1) {
-        compiler->enclosing->locals[local].is_captured = true;
-        return add_upvalue(compiler, local, true);
+    Local *local = resolve_local_entry(compiler->enclosing, name);
+    if (local != NULL) {
+        local->is_captured = true;
+        return add_upvalue(compiler, local->reg, true);
     }
 
     /* Check enclosing upvalues (recursive) */
@@ -539,15 +602,23 @@ static void compiler_init(Compiler *compiler, VM *vm, FunctionType type, Token *
     compiler->vm = vm;
     compiler->type = type;
     compiler->function = new_function(vm);
+    compiler->function_root = vm_root_value(vm, OBJ_VAL(compiler->function));
+    if (!compiler->function_root) {
+        fprintf(stderr, "Out of memory rooting active compiler function.\n");
+        exit(1);
+    }
     compiler->local_count = 0;
     compiler->scope_depth = 0;
     compiler->next_reg = 0;
     compiler->max_reg = 0;
+    compiler->register_overflow_reported = false;
     compiler->loop_start = -1;
+    compiler->loop_scope_depth = -1;
     compiler->break_jumps = NULL;
     compiler->break_count = 0;
     compiler->break_capacity = 0;
     compiler->error_handler_reg = -1;
+    compiler->error_handler_depth = -1;
     compiler->error_jumps = NULL;
     compiler->error_jump_count = 0;
     compiler->error_jump_capacity = 0;
@@ -561,9 +632,6 @@ static void compiler_init(Compiler *compiler, VM *vm, FunctionType type, Token *
     compiler->inline_candidates = NULL;
     compiler->inline_count = 0;
     compiler->inline_capacity = 0;
-    compiler->field_loop_candidates = NULL;
-    compiler->field_loop_count = 0;
-    compiler->field_loop_capacity = 0;
     compiler->owned_strings = NULL;
     compiler->owned_string_count = 0;
     compiler->owned_string_capacity = 0;
@@ -579,11 +647,17 @@ static void compiler_init(Compiler *compiler, VM *vm, FunctionType type, Token *
 
     if (name && name->length > 0) {
         compiler->function->name = copy_string(vm, name->start, name->length);
+        gc_write_barrier(vm, (Obj *)compiler->function,
+                         OBJ_VAL(compiler->function->name));
     }
     if (compiler->enclosing && compiler->enclosing->function->source_name) {
         compiler->function->source_name = compiler->enclosing->function->source_name;
+        gc_write_barrier(vm, (Obj *)compiler->function,
+                         OBJ_VAL(compiler->function->source_name));
     } else if (name && name->length > 0) {
         compiler->function->source_name = copy_string(vm, name->start, name->length);
+        gc_write_barrier(vm, (Obj *)compiler->function,
+                         OBJ_VAL(compiler->function->source_name));
     }
 
     current = compiler;
@@ -765,8 +839,14 @@ static int compile_binary(ASTNode *node) {
             case TOKEN_PLUS:    result = a + b; break;
             case TOKEN_MINUS:   result = a - b; break;
             case TOKEN_STAR:    result = a * b; break;
-            case TOKEN_SLASH:   result = b != 0.0 ? a / b : 0.0; break;
-            case TOKEN_PERCENT: result = b != 0.0 ? fmod(a, b) : 0.0; break;
+            case TOKEN_SLASH:
+                if (b == 0.0) goto no_fold;
+                result = a / b;
+                break;
+            case TOKEN_PERCENT:
+                if (b == 0.0) goto no_fold;
+                result = fmod(a, b);
+                break;
             default: goto no_fold;
         }
         int reg = alloc_reg();
@@ -834,7 +914,7 @@ no_fold:;
         }
     }
 
-compile_right_register:
+compile_right_register: ;
     int right = compile_node(node->as.binary.right);
     switch (node->as.binary.op) {
         case TOKEN_PLUS:
@@ -1130,7 +1210,9 @@ static JumpPatch compile_condition_jump(ASTNode *condition, int line) {
     }
 
     int cond = compile_node(condition);
-    return (JumpPatch){emit_test_jump(cond, line), false};
+    int jump = emit_test_jump(cond, line);
+    free_temp(cond);
+    return (JumpPatch){jump, false};
 }
 
 static void patch_condition_jump(JumpPatch jump) {
@@ -1239,100 +1321,6 @@ static void free_compiler_owned_strings(Compiler *compiler) {
         free(compiler->owned_strings[i]);
     }
     free(compiler->owned_strings);
-}
-
-static int method_param_arg_index(ASTNode *fn_decl, Token *name) {
-    for (int i = 1; i < fn_decl->as.fn_decl.param_count; i++) {
-        if (identifiers_equal(name, &fn_decl->as.fn_decl.params[i].name)) {
-            return i - 1;
-        }
-    }
-    return -1;
-}
-
-static bool match_field_increment_stmt(ASTNode *fn_decl, ASTNode *stmt,
-                                       Token *self_name, Token *field_name,
-                                       int *arg_index) {
-    if (stmt && stmt->type == NODE_EXPRESSION_STMT) {
-        stmt = stmt->as.expr_stmt.expr;
-    }
-    if (!stmt || stmt->type != NODE_FIELD_SET) return false;
-
-    ASTNode *object = stmt->as.field_set.object;
-    if (!object || object->type != NODE_IDENTIFIER ||
-        object->as.identifier.is_global ||
-        !identifiers_equal(&object->as.identifier.name, self_name)) {
-        return false;
-    }
-    *field_name = stmt->as.field_set.name;
-
-    ASTNode *value = stmt->as.field_set.value;
-    if (!value || value->type != NODE_BINARY || value->as.binary.op != TOKEN_PLUS) {
-        return false;
-    }
-    ASTNode *left = value->as.binary.left;
-    ASTNode *right = value->as.binary.right;
-    if (!left || left->type != NODE_FIELD_GET ||
-        !identifiers_equal(&left->as.field_get.name, field_name) ||
-        left->as.field_get.object->type != NODE_IDENTIFIER ||
-        left->as.field_get.object->as.identifier.is_global ||
-        !identifiers_equal(&left->as.field_get.object->as.identifier.name, self_name)) {
-        return false;
-    }
-    if (!right || right->type != NODE_IDENTIFIER || right->as.identifier.is_global) {
-        return false;
-    }
-
-    *arg_index = method_param_arg_index(fn_decl, &right->as.identifier.name);
-    return *arg_index >= 0;
-}
-
-static void register_field_loop_candidate(ASTNode *fn_decl) {
-    if (current != get_root_compiler() || current->scope_depth != 0 ||
-        !fn_decl->as.fn_decl.is_method ||
-        fn_decl->as.fn_decl.param_count < 2) {
-        return;
-    }
-
-    ASTNode *body = fn_decl->as.fn_decl.body;
-    if (!body || body->type != NODE_BLOCK || body->as.block.stmts.count != 2) return;
-
-    FieldLoopCandidate candidate;
-    memset(&candidate, 0, sizeof(candidate));
-    candidate.struct_name = fn_decl->as.fn_decl.method_struct;
-    candidate.method_name = fn_decl->as.fn_decl.name;
-    candidate.update_count = 2;
-
-    Token *self_name = &fn_decl->as.fn_decl.params[0].name;
-    if (!match_field_increment_stmt(fn_decl, body->as.block.stmts.nodes[0],
-                                    self_name, &candidate.field_names[0],
-                                    &candidate.param_indices[0]) ||
-        !match_field_increment_stmt(fn_decl, body->as.block.stmts.nodes[1],
-                                    self_name, &candidate.field_names[1],
-                                    &candidate.param_indices[1])) {
-        return;
-    }
-
-    Compiler *root = get_root_compiler();
-    if (root->field_loop_count >= root->field_loop_capacity) {
-        root->field_loop_capacity = root->field_loop_capacity < 4 ? 4 : root->field_loop_capacity * 2;
-        root->field_loop_candidates = realloc(root->field_loop_candidates,
-            sizeof(FieldLoopCandidate) * root->field_loop_capacity);
-    }
-    root->field_loop_candidates[root->field_loop_count++] = candidate;
-}
-
-static FieldLoopCandidate *find_field_loop_candidate(Token *struct_name, Token *method_name) {
-    Compiler *root = get_root_compiler();
-    if (current != root) return NULL;
-    for (int i = root->field_loop_count - 1; i >= 0; i--) {
-        FieldLoopCandidate *candidate = &root->field_loop_candidates[i];
-        if (identifiers_equal(struct_name, &candidate->struct_name) &&
-            identifiers_equal(method_name, &candidate->method_name)) {
-            return candidate;
-        }
-    }
-    return NULL;
 }
 
 static int compile_inline_call(ASTNode *node, InlineCandidate *candidate) {
@@ -1455,9 +1443,12 @@ static bool compile_local_update_fused_term(ASTNode *expr, MgTokenType update_op
         ASTNode *inner = expr->as.try_expr.expr;
         if (inner->type == NODE_INDEX &&
             inner->as.index_expr.index->type == NODE_STRING) {
-            int obj = compile_node(inner->as.index_expr.object);
             ASTNode *key = inner->as.index_expr.index;
             int field_k = string_constant(current->vm, key->as.string.value, key->as.string.length);
+            if (field_k > UINT8_MAX) {
+                return false;
+            }
+            int obj = compile_node(inner->as.index_expr.object);
             reserve_reg_index(target_reg + 1);
             emit(ENCODE_ABC(update_op == TOKEN_PLUS ? OP_ADDLOCAL_FIELD_PROP
                                                     : OP_SUBLOCAL_FIELD_PROP,
@@ -1628,317 +1619,18 @@ static bool local_update_chain_has_fused_term(ASTNode *expr, Token *target) {
            local_update_term_can_fuse(expr->as.binary.right);
 }
 
-static ASTNode *single_block_statement(ASTNode *body) {
-    if (!body || body->type != NODE_BLOCK || body->as.block.stmts.count != 1) return NULL;
-    return body->as.block.stmts.nodes[0];
-}
-
-static bool match_accum_delta_branch(ASTNode *branch, Token **target_name, int *delta) {
-    ASTNode *stmt = single_block_statement(branch);
-    if (!stmt) return false;
-    if (stmt->type == NODE_EXPRESSION_STMT) {
-        stmt = stmt->as.expr_stmt.expr;
-    }
-    if (!stmt || stmt->type != NODE_ASSIGN ||
-        stmt->as.assign.target->type != NODE_IDENTIFIER ||
-        stmt->as.assign.target->as.identifier.is_global) {
-        return false;
-    }
-
-    Token *name = &stmt->as.assign.target->as.identifier.name;
-    if (*target_name && !identifiers_equal(*target_name, name)) return false;
-
-    ASTNode *value = stmt->as.assign.value;
-    if (!value || value->type != NODE_BINARY || value->as.binary.op != TOKEN_PLUS) {
-        return false;
-    }
-    if (value->as.binary.left->type != NODE_IDENTIFIER ||
-        value->as.binary.left->as.identifier.is_global ||
-        !identifiers_equal(&value->as.binary.left->as.identifier.name, name)) {
-        return false;
-    }
-    if (value->as.binary.right->type != NODE_NUMBER ||
-        !number_fits_i8(value->as.binary.right, delta)) {
-        return false;
-    }
-
-    *target_name = name;
-    return true;
-}
-
-static bool match_mod_eq_condition(ASTNode *condition, Token *iter_name,
-                                   int *divisor, int *residue) {
-    if (!condition || condition->type != NODE_BINARY ||
-        condition->as.binary.op != TOKEN_EQUAL_EQUAL ||
-        condition->as.binary.left->type != NODE_BINARY ||
-        condition->as.binary.left->as.binary.op != TOKEN_PERCENT ||
-        condition->as.binary.right->type != NODE_NUMBER) {
-        return false;
-    }
-
-    ASTNode *mod = condition->as.binary.left;
-    if (mod->as.binary.left->type != NODE_IDENTIFIER ||
-        mod->as.binary.left->as.identifier.is_global ||
-        !identifiers_equal(&mod->as.binary.left->as.identifier.name, iter_name) ||
-        mod->as.binary.right->type != NODE_NUMBER) {
-        return false;
-    }
-
-    if (!number_fits_i8(mod->as.binary.right, divisor) ||
-        !number_fits_i8(condition->as.binary.right, residue) ||
-        *divisor == 0) {
-        return false;
-    }
-    return true;
-}
-
-static bool compile_for_range_mod_accumulator(ASTNode *node, int iter_reg, int end_reg) {
-    ASTNode *stmt = single_block_statement(node->as.for_range.body);
-    if (!stmt || stmt->type != NODE_IF) return false;
-
-    ASTNode *elseif_node = stmt->as.if_stmt.else_branch;
-    if (!elseif_node || elseif_node->type != NODE_IF ||
-        !elseif_node->as.if_stmt.else_branch) {
-        return false;
-    }
-
-    int divisor0, divisor1, residue0, residue1;
-    if (!match_mod_eq_condition(stmt->as.if_stmt.condition, &node->as.for_range.var,
-                                &divisor0, &residue0) ||
-        !match_mod_eq_condition(elseif_node->as.if_stmt.condition, &node->as.for_range.var,
-                                &divisor1, &residue1) ||
-        divisor0 != divisor1) {
-        return false;
-    }
-
-    Token *target_name = NULL;
-    int delta0, delta1, delta_else;
-    if (!match_accum_delta_branch(stmt->as.if_stmt.then_branch, &target_name, &delta0) ||
-        !match_accum_delta_branch(elseif_node->as.if_stmt.then_branch, &target_name, &delta1) ||
-        !match_accum_delta_branch(elseif_node->as.if_stmt.else_branch, &target_name, &delta_else)) {
-        return false;
-    }
-
-    int target_reg = -1;
-    bool target_const = false;
-    for (int i = current->local_count - 1; i >= 0; i--) {
-        if (identifiers_equal(target_name, &current->locals[i].name)) {
-            target_reg = current->locals[i].reg;
-            target_const = current->locals[i].is_const;
-            break;
-        }
-    }
-    if (target_reg < 0 || target_const || target_reg == iter_reg || target_reg == end_reg) {
-        return false;
-    }
-
-    emit(ENCODE_ABC(node->as.for_range.inclusive ? OP_FOR_MODI_ACCUM_INC : OP_FOR_MODI_ACCUM,
-                    iter_reg, target_reg, divisor0 & 0xff), node->line);
-    emit(ENCODE_ABC(OP_AUX, residue0 & 0xff, delta0 & 0xff, residue1 & 0xff), node->line);
-    emit(ENCODE_ABC(OP_AUX, delta1 & 0xff, delta_else & 0xff, 0), node->line);
-    return true;
-}
-
-static bool compile_for_range_field2_accumulator(ASTNode *node, int iter_reg, int end_reg) {
-    ASTNode *stmt = single_block_statement(node->as.for_range.body);
-    if (!stmt) return false;
-    if (stmt->type == NODE_EXPRESSION_STMT) {
-        stmt = stmt->as.expr_stmt.expr;
-    }
-    if (!stmt || stmt->type != NODE_CALL ||
-        stmt->as.call.callee->type != NODE_FIELD_GET) {
-        return false;
-    }
-
-    ASTNode *callee_obj = stmt->as.call.callee->as.field_get.object;
-    if (!callee_obj || callee_obj->type != NODE_IDENTIFIER ||
-        callee_obj->as.identifier.is_global) {
-        return false;
-    }
-
-    Local *receiver = resolve_local_entry(current, &callee_obj->as.identifier.name);
-    if (!receiver || !receiver->has_known_struct || receiver->reg < 0 ||
-        receiver->reg == iter_reg || receiver->reg == end_reg) {
-        return false;
-    }
-
-    FieldLoopCandidate *candidate = find_field_loop_candidate(
-        &receiver->known_struct,
-        &stmt->as.call.callee->as.field_get.name);
-    if (!candidate || candidate->update_count != 2) return false;
-
-    int deltas[2];
-    for (int i = 0; i < 2; i++) {
-        int arg_index = candidate->param_indices[i];
-        if (arg_index < 0 || arg_index >= stmt->as.call.args.count ||
-            stmt->as.call.args.nodes[arg_index]->type != NODE_NUMBER ||
-            !number_fits_i8(stmt->as.call.args.nodes[arg_index], &deltas[i])) {
-            return false;
-        }
-    }
-
-    int struct_k = identifier_constant(current->vm, &candidate->struct_name);
-    int field0_k = identifier_constant(current->vm, &candidate->field_names[0]);
-    int field1_k = identifier_constant(current->vm, &candidate->field_names[1]);
-    if (struct_k > 255 || field0_k > 255 || field1_k > 255) return false;
-
-    emit(ENCODE_ABC(node->as.for_range.inclusive ? OP_FOR_FIELD2_ACCUM_INC : OP_FOR_FIELD2_ACCUM,
-                    iter_reg, receiver->reg, struct_k), node->line);
-    emit(ENCODE_ABC(OP_AUX, field0_k, deltas[0] & 0xff, field1_k), node->line);
-    emit(ENCODE_ABC(OP_AUX, deltas[1] & 0xff, 0, 0), node->line);
-    return true;
-}
-
-static bool compile_for_range_field_accumulator(ASTNode *node, int iter_reg, int end_reg) {
-    ASTNode *stmt = single_block_statement(node->as.for_range.body);
-    if (!stmt) return false;
-
-    ASTNode *assign = stmt;
-    if (stmt->type == NODE_EXPRESSION_STMT) {
-        assign = stmt->as.expr_stmt.expr;
-    }
-    if (!assign || assign->type != NODE_ASSIGN ||
-        assign->as.assign.target->type != NODE_IDENTIFIER) {
-        return false;
-    }
-
-    Token *target_name = &assign->as.assign.target->as.identifier.name;
-    bool target_is_global = assign->as.assign.target->as.identifier.is_global ||
-                            resolve_global(target_name);
-    int target_reg = -1;
-    int target_k = -1;
-    if (!target_is_global) {
-        target_reg = resolve_local(current, target_name);
-        if (target_reg < 0 || target_reg == iter_reg || target_reg == end_reg) return false;
-    }
-
-    ASTNode *value = assign->as.assign.value;
-    if (!value || value->type != NODE_BINARY || value->as.binary.op != TOKEN_PLUS) return false;
-    ASTNode *left = value->as.binary.left;
-    ASTNode *right = value->as.binary.right;
-    if (!left || left->type != NODE_IDENTIFIER ||
-        !identifiers_equal(&left->as.identifier.name, target_name)) {
-        return false;
-    }
-    if (!target_is_global && left->as.identifier.is_global) return false;
-
-    if (!right || right->type != NODE_TRY) return false;
-    ASTNode *inner = right->as.try_expr.expr;
-    if (!inner || inner->type != NODE_INDEX ||
-        inner->as.index_expr.index->type != NODE_STRING) {
-        return false;
-    }
-    if (expr_references_name(inner, target_name) ||
-        expr_references_name(inner, &node->as.for_range.var) ||
-        !call_arg_is_safe(inner->as.index_expr.object)) {
-        return false;
-    }
-
-    if (target_is_global) {
-        target_reg = alloc_reg();
-        reserve_reg_index(target_reg + 1);
-        target_k = identifier_constant(current->vm, target_name);
-    }
-
-    int obj_reg = compile_node(inner->as.index_expr.object);
-    ASTNode *key = inner->as.index_expr.index;
-    int field_k = string_constant(current->vm, key->as.string.value, key->as.string.length);
-    if (target_is_global) {
-        emit(ENCODE_ABC(node->as.for_range.inclusive
-                            ? OP_FORADDGLOBAL_FIELD_PROP_INC
-                            : OP_FORADDGLOBAL_FIELD_PROP,
-                        iter_reg, target_reg, obj_reg), node->line);
-        emit(ENCODE_ABx(OP_AUX, 0, target_k), node->line);
-        emit(ENCODE_ABx(OP_AUX, 0, field_k), node->line);
-        free_temp(target_reg);
-    } else {
-        emit(ENCODE_ABC(node->as.for_range.inclusive
-                            ? OP_FORADDLOCAL_FIELD_PROP_INC
-                            : OP_FORADDLOCAL_FIELD_PROP,
-                        iter_reg, target_reg, obj_reg), node->line);
-        emit(ENCODE_ABx(OP_AUX, 0, field_k), node->line);
-    }
-    free_temp(obj_reg);
-    return true;
-}
-
-static bool branch_is_single_break(ASTNode *branch) {
-    ASTNode *stmt = single_block_statement(branch);
-    return stmt && stmt->type == NODE_BREAK;
-}
-
-static bool compile_array_mark_false_stride_loop(ASTNode *node) {
-    ASTNode *body = node->as.loop_stmt.body;
-    if (!body || body->type != NODE_BLOCK || body->as.block.stmts.count != 3) return false;
-
-    ASTNode *guard = body->as.block.stmts.nodes[0];
-    ASTNode *set_stmt = body->as.block.stmts.nodes[1];
-    ASTNode *inc_stmt = body->as.block.stmts.nodes[2];
-    if (!guard || guard->type != NODE_IF || guard->as.if_stmt.else_branch ||
-        !branch_is_single_break(guard->as.if_stmt.then_branch)) {
-        return false;
-    }
-
-    ASTNode *cond = guard->as.if_stmt.condition;
-    if (!cond || cond->type != NODE_BINARY || cond->as.binary.op != TOKEN_GREATER ||
-        cond->as.binary.left->type != NODE_IDENTIFIER ||
-        cond->as.binary.left->as.identifier.is_global ||
-        cond->as.binary.right->type != NODE_IDENTIFIER ||
-        cond->as.binary.right->as.identifier.is_global) {
-        return false;
-    }
-    Token *index_name = &cond->as.binary.left->as.identifier.name;
-    Token *limit_name = &cond->as.binary.right->as.identifier.name;
-
-    if (set_stmt->type == NODE_EXPRESSION_STMT) set_stmt = set_stmt->as.expr_stmt.expr;
-    if (!set_stmt || set_stmt->type != NODE_ASSIGN ||
-        set_stmt->as.assign.target->type != NODE_INDEX ||
-        set_stmt->as.assign.value->type != NODE_BOOL ||
-        set_stmt->as.assign.value->as.boolean.value) {
-        return false;
-    }
-    ASTNode *target = set_stmt->as.assign.target;
-    if (target->as.index_expr.object->type != NODE_IDENTIFIER ||
-        target->as.index_expr.object->as.identifier.is_global ||
-        target->as.index_expr.index->type != NODE_IDENTIFIER ||
-        target->as.index_expr.index->as.identifier.is_global ||
-        !identifiers_equal(index_name, &target->as.index_expr.index->as.identifier.name)) {
-        return false;
-    }
-    Token *array_name = &target->as.index_expr.object->as.identifier.name;
-
-    if (inc_stmt->type == NODE_EXPRESSION_STMT) inc_stmt = inc_stmt->as.expr_stmt.expr;
-    if (!inc_stmt || inc_stmt->type != NODE_ASSIGN ||
-        inc_stmt->as.assign.target->type != NODE_IDENTIFIER ||
-        inc_stmt->as.assign.target->as.identifier.is_global ||
-        !identifiers_equal(index_name, &inc_stmt->as.assign.target->as.identifier.name)) {
-        return false;
-    }
-    ASTNode *value = inc_stmt->as.assign.value;
-    if (!value || value->type != NODE_BINARY || value->as.binary.op != TOKEN_PLUS ||
-        value->as.binary.left->type != NODE_IDENTIFIER ||
-        value->as.binary.left->as.identifier.is_global ||
-        !identifiers_equal(index_name, &value->as.binary.left->as.identifier.name) ||
-        value->as.binary.right->type != NODE_IDENTIFIER ||
-        value->as.binary.right->as.identifier.is_global) {
-        return false;
-    }
-    Token *step_name = &value->as.binary.right->as.identifier.name;
-
-    int array_reg = resolve_local(current, array_name);
-    int index_reg = resolve_local(current, index_name);
-    int limit_reg = resolve_local(current, limit_name);
-    int step_reg = resolve_local(current, step_name);
-    if (array_reg < 0 || index_reg < 0 || limit_reg < 0 || step_reg < 0) return false;
-
-    emit(ENCODE_ABC(OP_ARRAY_MARK_FALSE_STRIDE, array_reg, index_reg, limit_reg), node->line);
-    emit(ENCODE_ABx(OP_AUX, 0, step_reg), node->line);
-    return true;
-}
-
 static int compile_call(ASTNode *node) {
     int arg_count = node->as.call.args.count;
     bool is_method_call = (node->as.call.callee->type == NODE_FIELD_GET);
+    int max_args = is_method_call ? UINT8_MAX - 1 : UINT8_MAX;
+    if (arg_count > max_args) {
+        Token token = {TOKEN_LEFT_PAREN, "(", 1, node->line};
+        error_at(&token,
+                 is_method_call
+                     ? "A method call supports at most 254 explicit arguments."
+                     : "A function call supports at most 255 arguments.");
+        arg_count = max_args;
+    }
 
     if (is_method_call &&
         arg_count == 1 &&
@@ -2084,6 +1776,8 @@ static int compile_call(ASTNode *node) {
             callee = base;
         } else {
             callee = alloc_reg();
+            mcallfield_k = u8_constant_or_error(mcallfield_k, node->line,
+                                                 "method lookup");
             emit(ENCODE_ABC(OP_GETFIELD, callee, obj_reg, mcallfield_k), node->line);
         }
     } else {
@@ -2146,6 +1840,21 @@ static int compile_call(ASTNode *node) {
 static int compile_call_with_expected(ASTNode *node, int expected_returns) {
     bool is_method_call = (node->as.call.callee->type == NODE_FIELD_GET);
     int arg_count = node->as.call.args.count;
+    int max_args = is_method_call ? UINT8_MAX - 1 : UINT8_MAX;
+    if (arg_count > max_args) {
+        Token token = {TOKEN_LEFT_PAREN, "(", 1, node->line};
+        error_at(&token,
+                 is_method_call
+                     ? "A method call supports at most 254 explicit arguments."
+                     : "A function call supports at most 255 arguments.");
+        arg_count = max_args;
+    }
+    if (expected_returns < 0 || expected_returns > UINT8_MAX - 1) {
+        Token token = {TOKEN_LEFT_PAREN, "(", 1, node->line};
+        error_at(&token,
+                 "A call supports at most 254 requested return values.");
+        expected_returns = expected_returns < 0 ? 0 : UINT8_MAX - 1;
+    }
     int obj_reg = -1;
     int callee = -1;
     int mcallfield_k = -1;
@@ -2180,6 +1889,7 @@ static int compile_call_with_expected(ASTNode *node, int expected_returns) {
             mcallfield_k = k;
         } else {
             callee = alloc_reg();
+            k = u8_constant_or_error(k, node->line, "method lookup");
             emit(ENCODE_ABC(OP_GETFIELD, callee, obj_reg, k), node->line);
         }
     } else {
@@ -2238,8 +1948,15 @@ static int compile_index_op(ASTNode *node, OpCode op) {
         }
         ASTNode *key = node->as.index_expr.index;
         int field_k = string_constant(current->vm, key->as.string.value, key->as.string.length);
-        emit(ENCODE_ABC(op == OP_GETINDEX_TRY ? OP_GETFIELD_TRY : OP_GETFIELD,
-                        dest, obj, field_k), node->line);
+        if (field_k <= UINT8_MAX) {
+            emit(ENCODE_ABC(op == OP_GETINDEX_TRY ? OP_GETFIELD_TRY : OP_GETFIELD,
+                            dest, obj, field_k), node->line);
+        } else {
+            int key_reg = alloc_reg();
+            emit(ENCODE_ABx(OP_LOADK, key_reg, field_k), key->line);
+            emit(ENCODE_ABC(op, dest, obj, key_reg), node->line);
+            free_temp(key_reg);
+        }
         free_temp(obj);
         return dest;
     }
@@ -2265,7 +1982,15 @@ static int compile_propagating_field_lookup(ASTNode *node) {
     ASTNode *key = node->as.index_expr.index;
     int field_k = string_constant(current->vm, key->as.string.value, key->as.string.length);
 
-    emit(ENCODE_ABC(OP_GETFIELD_PROP, dest, obj, field_k), node->line);
+    if (field_k <= UINT8_MAX) {
+        emit(ENCODE_ABC(OP_GETFIELD_PROP, dest, obj, field_k), node->line);
+    } else {
+        int key_reg = alloc_reg();
+        emit(ENCODE_ABx(OP_LOADK, key_reg, field_k), key->line);
+        emit(ENCODE_ABC(OP_GETINDEX_TRY, dest, obj, key_reg), node->line);
+        compile_propagate_error(err_reg, node->line);
+        free_temp(key_reg);
+    }
     free_temp(err_reg);
     free_temp(obj);
     return dest;
@@ -2276,6 +2001,7 @@ static void compile_propagate_error(int err_reg, int line) {
     int no_err_jump = emit_error_test_jump(err_reg, line);
 
     if (current->error_handler_reg >= 0) {
+        emit_scope_exit_cleanup(current->error_handler_depth, line);
         emit(ENCODE_ABC(OP_MOVE, current->error_handler_reg, err_reg, 0), line);
         add_error_jump(emit_jump(OP_JMP, line));
     } else {
@@ -2283,6 +2009,7 @@ static void compile_propagate_error(int err_reg, int line) {
         int out_err_reg = alloc_reg();
         emit(ENCODE_ABC(OP_LOADNIL, nil_reg, 0, 0), line);
         emit(ENCODE_ABC(OP_MOVE, out_err_reg, err_reg, 0), line);
+        emit_scope_exit_cleanup(-1, line);
         emit(ENCODE_ABC(OP_RETURN, nil_reg, 2, 0), line);
     }
 
@@ -2297,6 +2024,7 @@ static int compile_try(ASTNode *node) {
     ASTNode *expr = node->as.try_expr.expr;
     if (expr->type == NODE_INDEX) {
         if (current->error_handler_reg < 0 &&
+            current->defer_count == 0 &&
             expr->as.index_expr.index->type == NODE_STRING) {
             return compile_propagating_field_lookup(expr);
         }
@@ -2338,8 +2066,11 @@ static int compile_field_get(ASTNode *node) {
                                 if (s->field_names[fi] != NULL &&
                                     s->field_names[fi]->length == name->length &&
                                     memcmp(s->field_names[fi]->chars, name->start, name->length) == 0) {
-                                    emit(ENCODE_ABC(OP_GETFIELD_IDX, dest, obj, fi), node->line);
-                                    return dest;
+                                    if (fi <= UINT8_MAX) {
+                                        emit(ENCODE_ABC(OP_GETFIELD_IDX, dest, obj, fi), node->line);
+                                        return dest;
+                                    }
+                                    break;
                                 }
                             }
                         }
@@ -2350,6 +2081,7 @@ static int compile_field_get(ASTNode *node) {
         }
     }
 
+    k = u8_constant_or_error(k, node->line, "field access");
     emit(ENCODE_ABC(OP_GETFIELD, dest, obj, k), node->line);
     return dest;
 }
@@ -2357,11 +2089,13 @@ static int compile_field_get(ASTNode *node) {
 static int compile_array_literal(ASTNode *node) {
     int count = node->as.array_literal.items.count;
     int dest = alloc_reg();
-    emit(ENCODE_ABC(OP_NEWARRAY, dest, count, 0), node->line);
+    int hint = count > UINT8_MAX ? UINT8_MAX : count;
+    emit(ENCODE_ABC(OP_NEWARRAY, dest, hint, 0), node->line);
 
     for (int i = 0; i < count; i++) {
         int val = compile_node(node->as.array_literal.items.nodes[i]);
-        emit(ENCODE_ABC(OP_SETARRAY, dest, i, val), node->line);
+        emit(ENCODE_ABC(OP_ARRAY_PUSH, dest, val, 0), node->line);
+        free_temp(val);
     }
     return dest;
 }
@@ -2374,6 +2108,8 @@ static int compile_dict_literal(ASTNode *node) {
         int key = compile_node(node->as.dict_literal.entries.pairs[i].key);
         int val = compile_node(node->as.dict_literal.entries.pairs[i].value);
         emit(ENCODE_ABC(OP_SETINDEX, dest, key, val), node->line);
+        free_temp(val);
+        free_temp(key);
     }
     return dest;
 }
@@ -2405,7 +2141,9 @@ static int compile_struct_literal(ASTNode *node) {
         int field_k = string_constant(current->vm,
             key_node->as.string.value, key_node->as.string.length);
         int val = compile_node(node->as.struct_literal.fields.pairs[i].value);
+        field_k = u8_constant_or_error(field_k, node->line, "struct field initializer");
         emit(ENCODE_ABC(OP_SETFIELD, base, field_k, val), node->line);
+        free_temp(val);
     }
 
     return base;
@@ -2469,14 +2207,15 @@ static int compile_function(ASTNode *node, FunctionType type) {
     free(compiler.break_jumps);
     free(compiler.error_jumps);
     free(compiler.defers);
-    free(compiler.globals);
+    release_compiler_globals(&compiler);
     free(compiler.inline_candidates);
-    free(compiler.field_loop_candidates);
     free_compiler_owned_strings(&compiler);
 
     /* Emit closure instruction in the enclosing scope */
     int dest = alloc_reg();
     int k = make_constant(OBJ_VAL(fn));
+    vm_unroot_value(compiler.vm, compiler.function_root);
+    compiler.function_root = NULL;
     emit(ENCODE_ABx(OP_CLOSURE, dest, k), node->line);
 
     /* Emit upvalue capture info: one pseudo-instruction per upvalue */
@@ -2536,8 +2275,50 @@ static bool is_const_in_chain(Compiler *compiler, Token *name) {
     return false;
 }
 
+static bool emit_compound_binary(MgTokenType op, int dest, int left, int right,
+                                 int line) {
+    switch (op) {
+        case TOKEN_PLUS:    emit(ENCODE_ABC(OP_ADD, dest, left, right), line); return true;
+        case TOKEN_MINUS:   emit(ENCODE_ABC(OP_SUB, dest, left, right), line); return true;
+        case TOKEN_STAR:    emit(ENCODE_ABC(OP_MUL, dest, left, right), line); return true;
+        case TOKEN_SLASH:   emit(ENCODE_ABC(OP_DIV, dest, left, right), line); return true;
+        case TOKEN_PERCENT: emit(ENCODE_ABC(OP_MOD, dest, left, right), line); return true;
+        default: return false;
+    }
+}
+
+static bool compile_compound_index_assign(ASTNode *node) {
+    ASTNode *target = node->as.assign.target;
+    ASTNode *value = node->as.assign.value;
+    if (!target || target->type != NODE_INDEX ||
+        !value || value->type != NODE_BINARY ||
+        !value->as.binary.left || value->as.binary.left->type != NODE_INDEX) {
+        return false;
+    }
+
+    ASTNode *read = value->as.binary.left;
+    if (target->as.index_expr.object != read->as.index_expr.object ||
+        target->as.index_expr.index != read->as.index_expr.index) {
+        return false;
+    }
+
+    int obj = compile_node(target->as.index_expr.object);
+    int idx = compile_node(target->as.index_expr.index);
+    int previous = alloc_reg();
+    emit(ENCODE_ABC(OP_GETINDEX, previous, obj, idx), node->line);
+    int right = compile_node(value->as.binary.right);
+    int result = alloc_reg();
+    if (!emit_compound_binary(value->as.binary.op, result, previous, right, node->line)) {
+        return false;
+    }
+    emit(ENCODE_ABC(OP_SETINDEX, obj, idx, result), node->line);
+    return true;
+}
+
 static void compile_assign(ASTNode *node) {
     ASTNode *target = node->as.assign.target;
+
+    if (compile_compound_index_assign(node)) return;
 
     /* Check const enforcement before compiling the value */
     if (target->type == NODE_IDENTIFIER && is_push_name(&target->as.identifier.name) &&
@@ -2577,7 +2358,6 @@ static void compile_assign(ASTNode *node) {
             error_at(name, "Cannot assign to constant.");
             return;
         }
-        update_known_struct_for_local(name, node->as.assign.value);
     }
 
     if (target->type == NODE_IDENTIFIER && !target->as.identifier.is_global) {
@@ -2669,9 +2449,28 @@ static void compile_assign(ASTNode *node) {
 }
 
 static void compile_field_set(ASTNode *node) {
+    ASTNode *value = node->as.field_set.value;
+    if (value && value->type == NODE_BINARY &&
+        value->as.binary.left &&
+        value->as.binary.left->type == NODE_FIELD_GET &&
+        value->as.binary.left->as.field_get.object == node->as.field_set.object) {
+        int obj = compile_node(node->as.field_set.object);
+        int k = identifier_constant(current->vm, &node->as.field_set.name);
+        k = u8_constant_or_error(k, node->line, "compound field assignment");
+        int previous = alloc_reg();
+        emit(ENCODE_ABC(OP_GETFIELD, previous, obj, k), node->line);
+        int right = compile_node(value->as.binary.right);
+        int result = alloc_reg();
+        if (emit_compound_binary(value->as.binary.op, result, previous, right, node->line)) {
+            emit(ENCODE_ABC(OP_SETFIELD, obj, k, result), node->line);
+            return;
+        }
+    }
+
     int obj = compile_node(node->as.field_set.object);
     int val = compile_node(node->as.field_set.value);
     int k = identifier_constant(current->vm, &node->as.field_set.name);
+    k = u8_constant_or_error(k, node->line, "field assignment");
     emit(ENCODE_ABC(OP_SETFIELD, obj, k, val), node->line);
 }
 
@@ -2690,11 +2489,26 @@ static void compile_var_decl(ASTNode *node) {
 
     /* Multi-return: let a, b = func() */
     if (nnames > 1 && node->as.var_decl.initializer) {
+        if (nnames > UINT8_MAX - 1) {
+            error_at(name,
+                     "A call can bind at most 254 return values in the current bytecode format.");
+            return;
+        }
         /* The initializer must be a call expression for multi-return. */
         ASTNode *init = node->as.var_decl.initializer;
 
         if (init->type == NODE_TRY_BLOCK) {
             int base = compile_try_block(init);
+            /*
+             * A try block produces (value, error).  Keep general multi-binding
+             * behavior consistent with calls by filling any additional names
+             * with null, and reserve those registers in the frame.
+             */
+            for (int i = 2; i < nnames; i++) {
+                int reg = base + i;
+                while (current->next_reg <= reg) alloc_reg();
+                emit(ENCODE_ABC(OP_LOADNIL, reg, 0, 0), node->line);
+            }
             if (is_global) {
                 int k0 = identifier_constant(current->vm, name);
                 emit(ENCODE_ABx(OP_SETGLOBAL, base, k0), node->line);
@@ -2711,52 +2525,12 @@ static void compile_var_decl(ASTNode *node) {
                 }
             }
         } else if (init->type == NODE_CALL) {
-            bool is_method = (init->as.call.callee->type == NODE_FIELD_GET);
-            int arg_count = init->as.call.args.count;
-
-            int obj_reg = -1;
-            int callee;
-            if (is_method) {
-                ASTNode *fg = init->as.call.callee;
-                obj_reg = compile_node(fg->as.field_get.object);
-                callee = alloc_reg();
-                int k = identifier_constant(current->vm, &fg->as.field_get.name);
-                emit(ENCODE_ABC(OP_GETFIELD, callee, obj_reg, k), node->line);
-            } else {
-                callee = compile_node(init->as.call.callee);
-            }
-
-            int arg_regs[256];
-            for (int i = 0; i < arg_count; i++) {
-                arg_regs[i] = compile_node(init->as.call.args.nodes[i]);
-            }
-
-            int total_args = arg_count + (is_method ? 1 : 0);
-            int base = alloc_reg();
-            for (int i = 0; i < total_args; i++) alloc_reg();
-
-            if (callee != base)
-                emit(ENCODE_ABC(OP_MOVE, base, callee, 0), node->line);
-
-            if (is_method) {
-                if (obj_reg != base + 1)
-                    emit(ENCODE_ABC(OP_MOVE, base + 1, obj_reg, 0), node->line);
-                for (int i = 0; i < arg_count; i++) {
-                    int expected = base + 2 + i;
-                    if (arg_regs[i] != expected)
-                        emit(ENCODE_ABC(OP_MOVE, expected, arg_regs[i], 0), node->line);
-                }
-            } else {
-                for (int i = 0; i < arg_count; i++) {
-                    int expected = base + 1 + i;
-                    if (arg_regs[i] != expected)
-                        emit(ENCODE_ABC(OP_MOVE, expected, arg_regs[i], 0), node->line);
-                }
-            }
-
-            /* C = nnames + 1 means "expect nnames return values" */
-            emit(ENCODE_ABC(is_method ? OP_MCALL : OP_CALL, base, total_args, nnames + 1), node->line);
-
+            /*
+             * Reserve the larger of the argument and result spans.  The shared
+             * call compiler updates both next_reg and max_reg, so a call with
+             * few arguments and many results cannot write beyond the frame.
+             */
+            int base = compile_call_with_expected(init, nnames);
             /* Results are in base, base+1, ..., base+nnames-1 */
             /* Bind each to a local (or global) */
             if (is_global) {
@@ -2769,22 +2543,56 @@ static void compile_var_decl(ASTNode *node) {
             } else {
                 add_local(*name, base, is_const);
                 for (int i = 1; i < nnames; i++) {
-                    /* Allocate register for each extra name. */
                     int r = base + i;
-                    if (current->next_reg <= r) current->next_reg = r + 1;
                     add_local(node->as.var_decl.extra_names[i - 1], r, is_const);
                 }
             }
         } else {
             /* Non-call initializer with multiple names: only first gets the value */
             int val = compile_node(init);
-            int reg = alloc_reg();
-            if (val != reg) emit(ENCODE_ABC(OP_MOVE, reg, val, 0), node->line);
-            add_local(*name, reg, is_const);
+            if (is_global) {
+                int first_k = identifier_constant(current->vm, name);
+                emit(ENCODE_ABx(OP_SETGLOBAL, val, first_k), node->line);
+                int nil_reg = alloc_reg();
+                emit(ENCODE_ABC(OP_LOADNIL, nil_reg, 0, 0), node->line);
+                for (int i = 1; i < nnames; i++) {
+                    int k = identifier_constant(current->vm,
+                                                &node->as.var_decl.extra_names[i - 1]);
+                    emit(ENCODE_ABx(OP_SETGLOBAL, nil_reg, k), node->line);
+                }
+            } else {
+                int reg = alloc_reg();
+                if (val != reg) emit(ENCODE_ABC(OP_MOVE, reg, val, 0), node->line);
+                add_local(*name, reg, is_const);
+                for (int i = 1; i < nnames; i++) {
+                    int r = alloc_reg();
+                    emit(ENCODE_ABC(OP_LOADNIL, r, 0, 0), node->line);
+                    add_local(node->as.var_decl.extra_names[i - 1], r, is_const);
+                }
+            }
+        }
+        return;
+    }
+
+    if (nnames > 1) {
+        if (is_global) {
+            int nil_reg = alloc_reg();
+            emit(ENCODE_ABC(OP_LOADNIL, nil_reg, 0, 0), node->line);
+            int first_k = identifier_constant(current->vm, name);
+            emit(ENCODE_ABx(OP_SETGLOBAL, nil_reg, first_k), node->line);
             for (int i = 1; i < nnames; i++) {
-                int r = alloc_reg();
-                emit(ENCODE_ABC(OP_LOADNIL, r, 0, 0), node->line);
-                add_local(node->as.var_decl.extra_names[i - 1], r, is_const);
+                int k = identifier_constant(current->vm,
+                                            &node->as.var_decl.extra_names[i - 1]);
+                emit(ENCODE_ABx(OP_SETGLOBAL, nil_reg, k), node->line);
+            }
+        } else {
+            int first_reg = alloc_reg();
+            emit(ENCODE_ABC(OP_LOADNIL, first_reg, 0, 0), node->line);
+            add_local(*name, first_reg, is_const);
+            for (int i = 1; i < nnames; i++) {
+                int reg = alloc_reg();
+                emit(ENCODE_ABC(OP_LOADNIL, reg, 0, 0), node->line);
+                add_local(node->as.var_decl.extra_names[i - 1], reg, is_const);
             }
         }
         return;
@@ -2810,26 +2618,18 @@ static void compile_var_decl(ASTNode *node) {
         if (node->as.var_decl.initializer) {
             if (current->error_handler_reg < 0 &&
                 compile_node_into_reg(node->as.var_decl.initializer, reg)) {
-                Local *local = add_local(*name, reg, is_const);
-                if (local && node->as.var_decl.initializer->type == NODE_STRUCT_LITERAL) {
-                    local->has_known_struct = true;
-                    local->known_struct = node->as.var_decl.initializer->as.struct_literal.name;
-                }
+                add_local(*name, reg, is_const);
                 return;
             }
             int val = compile_node(node->as.var_decl.initializer);
             if (val != reg) {
                 emit(ENCODE_ABC(OP_MOVE, reg, val, 0), node->line);
             }
+            current->next_reg = reg + 1;
         } else {
             emit(ENCODE_ABC(OP_LOADNIL, reg, 0, 0), node->line);
         }
-        Local *local = add_local(*name, reg, is_const);
-        if (local && node->as.var_decl.initializer &&
-            node->as.var_decl.initializer->type == NODE_STRUCT_LITERAL) {
-            local->has_known_struct = true;
-            local->known_struct = node->as.var_decl.initializer->as.struct_literal.name;
-        }
+        add_local(*name, reg, is_const);
     }
 }
 
@@ -3016,17 +2816,15 @@ static bool node_calls_tostring_of_name(ASTNode *node, Token *name) {
 }
 
 static void compile_loop(ASTNode *node) {
-    if (compile_array_mark_false_stride_loop(node)) {
-        return;
-    }
-
     /* Save outer loop state */
     int outer_start = current->loop_start;
+    int outer_scope_depth = current->loop_scope_depth;
     int *outer_breaks = current->break_jumps;
     int outer_break_count = current->break_count;
     int outer_break_cap = current->break_capacity;
 
     current->loop_start = current_chunk()->count;
+    current->loop_scope_depth = current->scope_depth;
     current->break_jumps = NULL;
     current->break_count = 0;
     current->break_capacity = 0;
@@ -3047,6 +2845,7 @@ static void compile_loop(ASTNode *node) {
 
     /* Restore outer loop state */
     current->loop_start = outer_start;
+    current->loop_scope_depth = outer_scope_depth;
     current->break_jumps = outer_breaks;
     current->break_count = outer_break_count;
     current->break_capacity = outer_break_cap;
@@ -3054,12 +2853,14 @@ static void compile_loop(ASTNode *node) {
 
 static void compile_for_range(ASTNode *node) {
     int outer_start = current->loop_start;
+    int outer_scope_depth = current->loop_scope_depth;
     int *outer_breaks = current->break_jumps;
     int outer_break_count = current->break_count;
     int outer_break_cap = current->break_capacity;
     current->break_jumps = NULL;
     current->break_count = 0;
     current->break_capacity = 0;
+    current->loop_scope_depth = current->scope_depth;
 
     begin_scope();
 
@@ -3079,19 +2880,6 @@ static void compile_for_range(ASTNode *node) {
         current->next_reg = end_reg + 1;
     }
 
-    if (compile_for_range_mod_accumulator(node, iter_reg, end_reg) ||
-        compile_for_range_field2_accumulator(node, iter_reg, end_reg) ||
-        compile_for_range_field_accumulator(node, iter_reg, end_reg)) {
-        free(current->break_jumps);
-        end_scope(node->line);
-
-        current->loop_start = outer_start;
-        current->break_jumps = outer_breaks;
-        current->break_count = outer_break_count;
-        current->break_capacity = outer_break_cap;
-        return;
-    }
-
     bool numeric_range = node_contains_call(node->as.for_range.body) &&
                          !node_calls_tostring_of_name(node->as.for_range.body, &node->as.for_range.var);
     emit(ENCODE_ABC(numeric_range ? OP_FORPREP_NUM : OP_FORPREP,
@@ -3104,6 +2892,12 @@ static void compile_for_range(ASTNode *node) {
     int exit_jump = emit_asbx_jump(for_op, iter_reg, node->line);
 
     compile_block(node->as.for_range.body);
+    /*
+     * The loop body's lexical scope exits on every completed iteration.
+     * Emit its defers/closed-upvalue work before the back edge so zero-trip
+     * loops skip it and break/continue paths do not run it twice.
+     */
+    end_scope(node->line);
 
     int body_end = current_chunk()->count;
     int loop_offset = body_end - current->loop_start + 1;
@@ -3146,9 +2940,8 @@ static void compile_for_range(ASTNode *node) {
     }
     free(current->break_jumps);
 
-    end_scope(node->line);
-
     current->loop_start = outer_start;
+    current->loop_scope_depth = outer_scope_depth;
     current->break_jumps = outer_breaks;
     current->break_count = outer_break_count;
     current->break_capacity = outer_break_cap;
@@ -3156,12 +2949,14 @@ static void compile_for_range(ASTNode *node) {
 
 static void compile_for_in(ASTNode *node) {
     int outer_start = current->loop_start;
+    int outer_scope_depth = current->loop_scope_depth;
     int *outer_breaks = current->break_jumps;
     int outer_break_count = current->break_count;
     int outer_break_cap = current->break_capacity;
     current->break_jumps = NULL;
     current->break_count = 0;
     current->break_capacity = 0;
+    current->loop_scope_depth = current->scope_depth;
 
     begin_scope();
 
@@ -3191,6 +2986,8 @@ static void compile_for_in(ASTNode *node) {
     emit(ENCODE_ABC(OP_ITER_NEXT, var_reg, iter_state, 0), node->line);
 
     compile_block(node->as.for_in.body);
+    /* See compile_for_range(): body-scope cleanup belongs inside the loop. */
+    end_scope(node->line);
 
     int loop_offset = current_chunk()->count - current->loop_start + 1;
     emit(ENCODE_sBx(OP_LOOP, loop_offset), node->line);
@@ -3205,9 +3002,8 @@ static void compile_for_in(ASTNode *node) {
     }
     free(current->break_jumps);
 
-    end_scope(node->line);
-
     current->loop_start = outer_start;
+    current->loop_scope_depth = outer_scope_depth;
     current->break_jumps = outer_breaks;
     current->break_count = outer_break_count;
     current->break_capacity = outer_break_cap;
@@ -3215,19 +3011,28 @@ static void compile_for_in(ASTNode *node) {
 
 static void compile_return(ASTNode *node) {
     int count = node->as.return_stmt.values.count;
+    if (count > UINT8_MAX) {
+        Token token = {TOKEN_RETURN, "return", 6, node->line};
+        error_at(&token,
+                 "A function can return at most 255 values in the current bytecode format.");
+        return;
+    }
     if (count == 0) {
         int reg = alloc_reg();
         emit(ENCODE_ABC(OP_LOADNIL, reg, 0, 0), node->line);
+        emit_scope_exit_cleanup(-1, node->line);
         emit(ENCODE_ABC(OP_RETURN, reg, 1, 0), node->line);
     } else {
         int first = compile_node(node->as.return_stmt.values.nodes[0]);
         for (int i = 1; i < count; i++) {
             int r = compile_node(node->as.return_stmt.values.nodes[i]);
             int expected = first + i;
+            while (current->next_reg <= expected) alloc_reg();
             if (r != expected) {
                 emit(ENCODE_ABC(OP_MOVE, expected, r, 0), node->line);
             }
         }
+        emit_scope_exit_cleanup(-1, node->line);
         emit(ENCODE_ABC(OP_RETURN, first, count, 0), node->line);
     }
 }
@@ -3262,11 +3067,13 @@ static int compile_try_block(ASTNode *node) {
     emit(ENCODE_ABC(OP_LOADNIL, err_reg, 0, 0), node->line);
 
     int outer_handler = current->error_handler_reg;
+    int outer_handler_depth = current->error_handler_depth;
     int *outer_jumps = current->error_jumps;
     int outer_jump_count = current->error_jump_count;
     int outer_jump_capacity = current->error_jump_capacity;
 
     current->error_handler_reg = err_reg;
+    current->error_handler_depth = current->scope_depth;
     current->error_jumps = NULL;
     current->error_jump_count = 0;
     current->error_jump_capacity = 0;
@@ -3286,6 +3093,7 @@ static int compile_try_block(ASTNode *node) {
     emit(ENCODE_ABC(OP_LOADNIL, result_reg, 0, 0), node->line);
 
     current->error_handler_reg = outer_handler;
+    current->error_handler_depth = outer_handler_depth;
     current->error_jumps = outer_jumps;
     current->error_jump_count = outer_jump_count;
     current->error_jump_capacity = outer_jump_capacity;
@@ -3298,11 +3106,13 @@ static void compile_try_catch(ASTNode *node) {
     int err_reg = alloc_reg();
 
     int outer_handler = current->error_handler_reg;
+    int outer_handler_depth = current->error_handler_depth;
     int *outer_jumps = current->error_jumps;
     int outer_jump_count = current->error_jump_count;
     int outer_jump_capacity = current->error_jump_capacity;
 
     current->error_handler_reg = err_reg;
+    current->error_handler_depth = current->scope_depth;
     current->error_jumps = NULL;
     current->error_jump_count = 0;
     current->error_jump_capacity = 0;
@@ -3319,6 +3129,7 @@ static void compile_try_catch(ASTNode *node) {
     free(current->error_jumps);
 
     current->error_handler_reg = outer_handler;
+    current->error_handler_depth = outer_handler_depth;
     current->error_jumps = outer_jumps;
     current->error_jump_count = outer_jump_count;
     current->error_jump_capacity = outer_jump_capacity;
@@ -3383,8 +3194,10 @@ static void compile_fn_decl(ASTNode *node) {
         }
 
         int method_k = identifier_constant(current->vm, &node->as.fn_decl.name);
+        method_k = u8_constant_or_error(method_k, node->line, "method declaration");
         emit(ENCODE_ABC(OP_SETFIELD, struct_reg, method_k, fn_reg), node->line);
-        register_field_loop_candidate(node);
+        free_temp(struct_reg);
+        free_temp(fn_reg);
     } else if (node->as.fn_decl.name.length > 0) {
         /* Named function: bind to global or local */
         if (top_level_global) {
@@ -3398,6 +3211,9 @@ static void compile_fn_decl(ASTNode *node) {
                 emit(ENCODE_ABC(OP_MOVE, fn_binding_reg, fn_reg, 0), node->line);
             } else {
                 add_local(node->as.fn_decl.name, fn_reg, false);
+            }
+            if (fn_binding_reg != -1) {
+                current->next_reg = fn_binding_reg + 1;
             }
         }
     }
@@ -3423,12 +3239,19 @@ static void compile_struct_decl(ASTNode *node) {
     /* OP_NEWSTRUCT A Bx: R[A] = new struct named K[Bx] */
     emit(ENCODE_ABx(OP_NEWSTRUCT, dest, name_k), node->line);
 
-    /* Emit field count as pseudo-instruction */
-    emit(ENCODE_ABC(node->as.struct_decl.field_count, 0, 0, 0), node->line);
+    /* Field metadata pseudo-instructions use their opcode byte as payload. */
+    int field_count = node->as.struct_decl.field_count;
+    if (field_count > UINT8_MAX) {
+        error_at(&node->as.struct_decl.name,
+                 "Structs support at most 255 fields in the current bytecode format.");
+        field_count = 0;
+    }
+    emit(ENCODE_ABC(field_count, 0, 0, 0), node->line);
 
     /* Emit field name constant indices */
-    for (int i = 0; i < node->as.struct_decl.field_count; i++) {
+    for (int i = 0; i < field_count; i++) {
         int field_k = identifier_constant(current->vm, &node->as.struct_decl.fields[i].name);
+        field_k = u8_constant_or_error(field_k, node->line, "struct field metadata");
         emit(ENCODE_ABC(field_k, 0, 0, 0), node->line);
     }
 
@@ -3465,6 +3288,8 @@ static void compile_enum_decl(ASTNode *node) {
         emit(ENCODE_ABx(OP_LOADK, val_reg, ik), node->line);
 
         emit(ENCODE_ABC(OP_SETINDEX, dest, key_reg, val_reg), node->line);
+        free_temp(val_reg);
+        free_temp(key_reg);
     }
 
     if (top_level_global) {
@@ -3596,6 +3421,9 @@ static void compile_stmt(ASTNode *node) {
         case NODE_LET:
         case NODE_CONST:
             compile_var_decl(node);
+            if (node->as.var_decl.is_global) {
+                current->next_reg = saved_reg;
+            }
             break;
         case NODE_ASSIGN:
             compile_assign(node);
@@ -3638,6 +3466,7 @@ static void compile_stmt(ASTNode *node) {
                 Token err_tok = {TOKEN_BREAK, "break", 5, node->line};
                 error_at(&err_tok, "'break' outside of loop.");
             } else {
+                emit_scope_exit_cleanup(current->loop_scope_depth, node->line);
                 int jump = emit_jump(OP_JMP, node->line);
                 add_break_jump(jump);
             }
@@ -3647,6 +3476,7 @@ static void compile_stmt(ASTNode *node) {
                 Token err_tok = {TOKEN_CONTINUE, "continue", 8, node->line};
                 error_at(&err_tok, "'continue' outside of loop.");
             } else {
+                emit_scope_exit_cleanup(current->loop_scope_depth, node->line);
                 int loop_offset = current_chunk()->count - current->loop_start + 1;
                 emit(ENCODE_sBx(OP_LOOP, loop_offset), node->line);
             }
@@ -3929,12 +3759,14 @@ static ObjFunction *compile_with_options(VM *vm, ASTNode *ast,
     fn->reg_count = compiler.max_reg;  /* actual register count for stack sizing */
     current = compiler.enclosing;
     free(compiler.break_jumps);
+    free(compiler.error_jumps);
     free(compiler.defers);
-    free(compiler.globals);
+    release_compiler_globals(&compiler);
     free(compiler.inline_candidates);
-    free(compiler.field_loop_candidates);
     free_compiler_owned_strings(&compiler);
 
+    vm_unroot_value(compiler.vm, compiler.function_root);
+    compiler.function_root = NULL;
     if (compiler.had_error) return NULL;
     return fn;
 }

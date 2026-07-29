@@ -265,9 +265,30 @@ static Token scan_interp_string(Scanner *scanner) {
     if (peek(scanner) != '"') return error_token(scanner, "Expected '\"' after '_'.");
     advance(scanner); /* consume opening '"' */
 
-    while (peek(scanner) != '"' && !is_at_end(scanner)) {
-        if (peek(scanner) == '\\') advance(scanner); /* skip escape */
-        if (peek(scanner) == '\n') scanner->line++;
+    int brace_depth = 0;
+    bool expression_string = false;
+    while (!is_at_end(scanner)) {
+        char c = peek(scanner);
+        if (c == '\\') {
+            advance(scanner);
+            if (!is_at_end(scanner)) {
+                if (peek(scanner) == '\n') scanner->line++;
+                advance(scanner);
+            }
+            continue;
+        }
+        if (c == '\n') scanner->line++;
+
+        if (brace_depth == 0) {
+            if (c == '"') break;
+            if (c == '{') brace_depth = 1;
+        } else if (c == '"') {
+            expression_string = !expression_string;
+        } else if (!expression_string && c == '{') {
+            brace_depth++;
+        } else if (!expression_string && c == '}') {
+            brace_depth--;
+        }
         advance(scanner);
     }
 

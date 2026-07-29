@@ -7,6 +7,104 @@ $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Binary = if ($env:BINARY) { $env:BINARY } else { Join-Path $RepoRoot "magnesium.exe" }
 $Timeout = if ($env:TIMEOUT) { [int]$env:TIMEOUT } else { 5 }
 
+function Quote-ProcessArgument {
+    param([string]$Value)
+    if ($Value.IndexOf([char]0) -ge 0) { throw "Process argument contains NUL" }
+    if ($Value.IndexOf('"') -ge 0) { throw "Process arguments containing quotes are not supported" }
+    $trailingSlashes = 0
+    for ($i = $Value.Length - 1; $i -ge 0 -and $Value[$i] -eq [char]92; $i--) {
+        $trailingSlashes++
+    }
+    $prefixLength = $Value.Length - $trailingSlashes
+    $escaped = $Value.Substring(0, $prefixLength)
+    if ($trailingSlashes -gt 0) {
+        $escaped += [string]::new([char]92, $trailingSlashes * 2)
+    }
+    return '"' + $escaped + '"'
+}
+
+function Invoke-CapturedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (($Arguments | ForEach-Object {
+        Quote-ProcessArgument ([string]$_)
+    }) -join " ")
+    $startInfo.WorkingDirectory = [string]$RepoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $normalizedEnvironment = @{}
+    foreach ($entry in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        $normalizedEnvironment[$entry.Key.ToString().ToUpperInvariant()] = [string]$entry.Value
+    }
+    $processEnvironment = $startInfo.Environment
+    if ($null -eq $processEnvironment) {
+        $processEnvironment = $startInfo.EnvironmentVariables
+    }
+    if ($null -ne $processEnvironment) {
+        $processEnvironment.Clear()
+        foreach ($key in $normalizedEnvironment.Keys) {
+            $processEnvironment[$key] = $normalizedEnvironment[$key]
+        }
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        $process.Dispose()
+        throw "Failed to start $FilePath"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $exited) {
+        try { $process.Kill($true) } catch { try { $process.Kill() } catch { } }
+        $process.WaitForExit()
+    }
+    $stdout = [string]$stdoutTask.Result
+    $stderr = [string]$stderrTask.Result
+    $exitCode = if ($exited) { $process.ExitCode } else { -1 }
+    $process.Dispose()
+    return [pscustomobject]@{
+        Exited = $exited
+        ExitCode = $exitCode
+        Stdout = $stdout
+        Stderr = $stderr
+    }
+}
+
+function Find-Python {
+    $candidates = @()
+    if ($env:PYTHON) {
+        $candidates += @{ Exe = $env:PYTHON; Prefix = @() }
+    }
+    $candidates += @(
+        @{ Exe = "python3"; Prefix = @() },
+        @{ Exe = "python"; Prefix = @() },
+        @{ Exe = "py"; Prefix = @("-3") }
+    )
+    foreach ($candidate in $candidates) {
+        if (-not (Get-Command $candidate.Exe -ErrorAction SilentlyContinue)) { continue }
+        try {
+            $probe = Invoke-CapturedProcess -FilePath $candidate.Exe `
+                -Arguments @($candidate.Prefix + @("-c", "import sys")) `
+                -TimeoutSeconds $Timeout
+            if ($probe.Exited -and $probe.ExitCode -eq 0) { return $candidate }
+        } catch {
+            continue
+        }
+    }
+    throw "Python 3 was not found (tried python3, python, and py -3)"
+}
+
 $TmpDir = Join-Path $env:TEMP "mg_bytecode_test_$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir | Out-Null
 
@@ -22,7 +120,7 @@ try {
     @"
 let x = 123
 print(x)
-"@ | Set-Content $validSrc
+"@ | Set-Content -LiteralPath $validSrc -Encoding Ascii
 
     @"
 let total = 0
@@ -30,16 +128,36 @@ for i in 0..10
     total = total + i
 end
 print(total)
-"@ | Set-Content $loopSrc
+"@ | Set-Content -LiteralPath $loopSrc -Encoding Ascii
 
-    & $Binary build $validSrc | Out-Null
-    & $Binary build $loopSrc | Out-Null
+    foreach ($source in @($validSrc, $loopSrc)) {
+        $build = Invoke-CapturedProcess -FilePath $Binary `
+            -Arguments @("build", $source) -TimeoutSeconds $Timeout
+        if (-not $build.Exited) { throw "Bytecode build timed out for $source" }
+        if ($build.ExitCode -ne 0) {
+            throw "Bytecode build failed for ${source}: $($build.Stderr)"
+        }
+    }
 
     $validMgc = Join-Path $TmpDir "valid.mgc"
     $loopMgc = Join-Path $TmpDir "loop.mgc"
     $mutDir = Join-Path $TmpDir "mutated"
     $manifest = Join-Path $TmpDir "manifest.txt"
     New-Item -ItemType Directory -Path $mutDir | Out-Null
+
+    $validRun = Invoke-CapturedProcess -FilePath $Binary `
+        -Arguments @($validMgc) -TimeoutSeconds $Timeout
+    $validOutput = ([string]$validRun.Stdout).
+        Replace("`r`n", "`n").Replace("`r", "`n").TrimEnd()
+    if (-not $validRun.Exited) {
+        throw "Valid bytecode execution timed out"
+    }
+    if ($validRun.ExitCode -ne 0 -or
+            -not [string]::IsNullOrWhiteSpace($validRun.Stderr) -or
+            $validOutput -cne "123") {
+        throw "Valid bytecode execution failed: exit $($validRun.ExitCode), " +
+            "stdout '$validOutput', stderr '$($validRun.Stderr)'"
+    }
 
     $pyScript = @'
 import pathlib, shutil, struct, sys
@@ -163,7 +281,14 @@ with manifest_path.open("w", encoding="utf-8") as m:
 
     $pyFile = Join-Path $TmpDir "mutate_bytecode.py"
     Set-Content -Path $pyFile -Value $pyScript -Encoding UTF8
-    & python3 $pyFile $validMgc $loopMgc $mutDir $manifest
+    $python = Find-Python
+    $pythonRun = Invoke-CapturedProcess -FilePath $python.Exe `
+        -Arguments @($python.Prefix + @($pyFile, $validMgc, $loopMgc, $mutDir, $manifest)) `
+        -TimeoutSeconds $Timeout
+    if (-not $pythonRun.Exited) { throw "Python bytecode mutation timed out" }
+    if ($pythonRun.ExitCode -ne 0) {
+        throw "Python bytecode mutation failed: $($pythonRun.Stderr)"
+    }
 
     $Passed = 0
     $Failed = 0
@@ -176,14 +301,15 @@ with manifest_path.open("w", encoding="utf-8") as m:
         $name = $parts[0]
         $path = $parts[1]
 
-        $outFile = Join-Path $TmpDir "$name.out"
-        $errFile = Join-Path $TmpDir "$name.err"
-        $proc = Start-Process -FilePath $Binary -ArgumentList @($path) -NoNewWindow -Wait -PassThru `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        $stdout = if (Test-Path $outFile) { Get-Content $outFile -Raw } else { "" }
-        $stderr = if (Test-Path $errFile) { Get-Content $errFile -Raw } else { "" }
-        $output = $stdout + $stderr
-        $exitCode = $proc.ExitCode
+        $run = Invoke-CapturedProcess -FilePath $Binary -Arguments @($path) `
+            -TimeoutSeconds $Timeout
+        if (-not $run.Exited) {
+            Write-Host "  FAIL  $name (timed out after ${Timeout}s)" -ForegroundColor Red
+            $Failed++
+            return
+        }
+        $output = [string]$run.Stdout + [string]$run.Stderr
+        $exitCode = $run.ExitCode
 
         if ($exitCode -ge 128) {
             Write-Host "  FAIL  $name (terminated by signal)" -ForegroundColor Red

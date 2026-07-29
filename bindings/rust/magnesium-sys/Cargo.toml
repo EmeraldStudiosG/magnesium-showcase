@@ -1,9 +1,12 @@
 [package]
 name = "magnesium-sys"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Raw FFI bindings to the Magnesium language C API"
 links = "magnesium"
+# Distributed by `mt install rust` together with the canonical `src/` tree.
+# This crate is not a self-contained crates.io package.
+publish = false
 
 [features]
 default = ["vendored"]

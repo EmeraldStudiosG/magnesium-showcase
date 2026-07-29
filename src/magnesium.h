@@ -9,22 +9,26 @@
 #include <pthread.h>
 #endif
 
+#if !defined(__GNUC__) && !defined(__clang__)
+#define __builtin_expect(expression, expected) (expression)
+#endif
+
 /* ========================================================================
  * Core Header
  * ======================================================================== */
 
 /* Configuration */
 #define MG_VERSION_MAJOR 1
-#define MG_VERSION_MINOR 0
+#define MG_VERSION_MINOR 1
 #define MG_VERSION_PATCH 0
-#define MG_VERSION_STRING "1.0.0"
+#define MG_VERSION_STRING "1.1.0"
 
 #define MAX_REGISTERS   256
 #define MAX_CONSTANTS   65536
 #define MAX_LOCALS      256
 #define MAX_UPVALUES    256
 #define MAX_CALL_FRAMES 256
-#define STACK_INIT_SIZE 65536
+#define STACK_INIT_SIZE 1024
 #define GC_HEAP_GROW_FACTOR 2
 
 #define MG_ATOMIC_LOAD_BOOL(flag) atomic_load_explicit(&(flag), memory_order_acquire)
@@ -47,6 +51,25 @@ typedef struct Slab {
 #define MG_THREAD_LOCAL _Thread_local
 #endif
 
+/* Public embedding ABI. Define MG_BUILD_SHARED while building the shared
+ * library, or MG_USE_SHARED when consuming it on Windows. Static builds and
+ * the interpreter leave MG_API empty. */
+#ifndef MG_API
+#if defined(_WIN32) || defined(__CYGWIN__)
+#if defined(MG_BUILD_SHARED)
+#define MG_API __declspec(dllexport)
+#elif defined(MG_USE_SHARED)
+#define MG_API __declspec(dllimport)
+#else
+#define MG_API
+#endif
+#elif defined(MG_BUILD_SHARED) && (defined(__GNUC__) || defined(__clang__))
+#define MG_API __attribute__((visibility("default")))
+#else
+#define MG_API
+#endif
+#endif
+
 /* ========================================================================
  * Forward Declarations
  * ======================================================================== */
@@ -65,6 +88,8 @@ typedef struct ObjInstance ObjInstance;
 typedef struct ObjError ObjError;
 typedef struct ObjVMTask ObjVMTask;
 typedef struct ObjCoroutine ObjCoroutine;
+typedef struct VMRoot VMRoot;
+typedef struct NativeArgRoot NativeArgRoot;
 typedef struct VM VM;
 
 /* ========================================================================
@@ -190,9 +215,10 @@ static inline Value NUMBER_AUTO_VAL(double num) {
 /* Only false and null are falsey */
 #define IS_FALSEY(v)       (IS_NULL(v) || (IS_BOOL(v) && !AS_BOOL(v)))
 
-bool values_equal(Value a, Value b);
+MG_API bool values_equal(Value a, Value b);
 
-void print_value(Value value);
+MG_API void print_value(Value value);
+int format_number(char *buffer, size_t capacity, double number);
 
 /* ========================================================================
  * Heap Object System
@@ -306,7 +332,7 @@ struct ObjDict {
     uint32_t version;
     ObjString *mono_cache_key;
     DictEntry *mono_cache_entry;
-    uint32_t mono_cache_version;
+    Value mono_cache_value;
     int32_t *indices;    /* probe table: 0=empty, TOMBSTONE_IDX=deleted, >0=entry index+1 */
     int entry_count;     /* total entries allocated (active + deleted) */
     int entry_capacity;  /* allocated capacity of entries array */
@@ -528,10 +554,10 @@ typedef struct {
     Value *constants;
 } Chunk;
 
-void chunk_init(Chunk *chunk);
-void chunk_free(Chunk *chunk);
-void chunk_write(Chunk *chunk, Instruction inst, int line);
-int chunk_add_constant(Chunk *chunk, Value value);
+MG_API void chunk_init(Chunk *chunk);
+MG_API void chunk_free(Chunk *chunk);
+MG_API void chunk_write(Chunk *chunk, Instruction inst, int line);
+MG_API int chunk_add_constant(Chunk *chunk, Value value);
 
 /* ========================================================================
  * Function Object (compiled bytecode + metadata)
@@ -569,6 +595,7 @@ typedef struct {
     Value *slots;            /* pointer into register window */
     int call_dest;           /* register in caller where result should be stored */
     int expected_returns;    /* how many return values the caller expects */
+    int caller_stack_top;     /* active stack high-water mark before this call */
 } CallFrame;
 
 typedef struct SavedVMContext {
@@ -600,8 +627,9 @@ typedef void (*NativeHandleFinalizer)(void *data);
 struct ObjNative {
     Obj obj;
     NativeFn function;
-    const char *name;
+    ObjString *name;
     int arity;           /* -1 = variadic */
+    bool copy_args;      /* host callbacks receive stable, GC-visible arguments */
     void *userdata;      /* opaque pointer for FFI trampolines */
     void (*userdata_finalizer)(void *);  /* called when GC frees this ObjNative */
 };
@@ -612,7 +640,7 @@ struct ObjNative {
 struct ObjFFI {
     Obj obj;
     void *c_function;
-    const char *name;
+    ObjString *name;
     int arity;
 };
 
@@ -991,27 +1019,28 @@ struct ASTNode {
 };
 
 /* AST allocation / helpers */
-ASTNode *ast_alloc(NodeType type, int line);
-void ast_free(ASTNode *node);
-MgTypeRef *type_ref_alloc(MgTypeKind kind, int line);
-void type_ref_free(MgTypeRef *type);
-void node_list_init(NodeList *list);
-void node_list_write(NodeList *list, ASTNode *node);
-void node_list_free(NodeList *list);
-void kv_list_init(KVList *list);
-void kv_list_write(KVList *list, ASTNode *key, ASTNode *value);
-void kv_list_free(KVList *list);
+MG_API ASTNode *ast_alloc(NodeType type, int line);
+MG_API void ast_free(ASTNode *node);
+MG_API MgTypeRef *type_ref_alloc(MgTypeKind kind, int line);
+MG_API void type_ref_free(MgTypeRef *type);
+MG_API void node_list_init(NodeList *list);
+MG_API void node_list_write(NodeList *list, ASTNode *node);
+MG_API void node_list_free(NodeList *list);
+MG_API void kv_list_init(KVList *list);
+MG_API void kv_list_write(KVList *list, ASTNode *key, ASTNode *value);
+MG_API void kv_list_free(KVList *list);
 
 /* ========================================================================
  * Hash Table API (defined above)
  * ======================================================================== */
 
-void table_init(Table *table);
-void table_free(Table *table);
-bool table_get(Table *table, ObjString *key, Value *value);
-bool table_set(Table *table, ObjString *key, Value value);
-bool table_delete(Table *table, ObjString *key);
-ObjString *table_find_string(Table *table, const char *chars, int length, uint32_t hash);
+MG_API void table_init(Table *table);
+MG_API void table_free(Table *table);
+MG_API bool table_get(Table *table, ObjString *key, Value *value);
+MG_API bool table_set(Table *table, ObjString *key, Value value);
+MG_API bool table_delete(Table *table, ObjString *key);
+MG_API ObjString *table_find_string(Table *table, const char *chars, int length,
+                                    uint32_t hash);
 
 /* ========================================================================
  * Virtual Machine
@@ -1046,6 +1075,17 @@ typedef struct {
     int index;
 } DictICEntry;
 
+struct VMRoot {
+    Value value;
+    VMRoot *next;
+};
+
+struct NativeArgRoot {
+    Value *values;
+    int count;
+    NativeArgRoot *previous;
+};
+
 struct VM {
     /* Call stack */
     CallFrame frames[MAX_CALL_FRAMES];
@@ -1072,6 +1112,9 @@ struct VM {
 
     /* Open upvalues (linked list) */
     ObjUpvalue *open_upvalues;
+
+    /* Values retained explicitly by host-language bindings. */
+    VMRoot *host_roots;
 
     /* Currently executing coroutine, if vm_execute was entered by coroutine.resume. */
     ObjCoroutine *current_coroutine;
@@ -1122,6 +1165,9 @@ struct VM {
 
     /* Integer-to-string cache: maps small non-negative integers to interned ObjString* */
     ObjString **int_str_cache;
+    uint32_t *int_str_cache_used;
+    int int_str_cache_used_count;
+    int int_str_cache_used_capacity;
 
     /* Slab allocator: free lists and backing slabs for small objects */
     Obj  *slab_free_lists[SLAB_CLASS_COUNT];
@@ -1133,6 +1179,7 @@ struct VM {
     size_t bytes_allocated;
     size_t young_bytes;       /* bytes in young generation only */
     size_t next_gc;
+    bool minor_gc_active;     /* minor tracing ignores old-to-old edges */
 
     /* Remembered set: old-gen objects that reference young-gen objects */
     Obj **remembered_set;
@@ -1149,7 +1196,11 @@ struct VM {
     char last_error_file[256];
     char last_error_function[128];
     int last_error_line;
+    bool suppress_error_output;  /* capture diagnostics without writing to stderr */
     void *calling_native_userdata;  /* set before native dispatch, for FFI trampolines */
+
+    /* Stable argument snapshots for currently executing host callbacks. */
+    NativeArgRoot *native_arg_roots;
 };
 
 typedef enum {
@@ -1159,137 +1210,156 @@ typedef enum {
     INTERPRET_YIELD
 } InterpretResult;
 
-void vm_init(VM *vm);
-void vm_free(VM *vm);
-VM *vm_new(void);
-void vm_delete(VM *vm);
-void vm_register_native(VM *vm, const char *name, NativeFn function, int arity,
-                        void *userdata, void (*userdata_finalizer)(void *));
-ObjFFI *vm_register_ffi(VM *vm, const char *name, void *c_func, int arity);
-ObjNativeHandle *vm_new_native_handle(VM *vm, const char *type_name, void *data,
-                                      NativeHandleFinalizer finalizer);
-bool vm_native_handle_set_method(VM *vm, ObjNativeHandle *handle, const char *name,
-                                 NativeFn function, int arity,
-                                 void *userdata, void (*userdata_finalizer)(void *));
-void *vm_native_handle_data(Value value, const char *type_name);
-Value vm_native_handle_value(ObjNativeHandle *handle);
-bool vm_set_global_value(VM *vm, const char *name, Value value);
-bool vm_get_global_value(VM *vm, const char *name, Value *out);
-InterpretResult vm_interpret(VM *vm, const char *source);
-InterpretResult vm_interpret_named(VM *vm, const char *source, const char *name);
-InterpretResult vm_run_function(VM *vm, ObjFunction *function);
-ObjFunction *vm_compile(VM *vm, const char *source);
-ObjFunction *vm_compile_named(VM *vm, const char *source, const char *name);
-bool vm_save_bytecode(VM *vm, ObjFunction *function, const char *path);
-ObjFunction *vm_load_bytecode(VM *vm, const char *path);
-void vm_push(VM *vm, Value value);
-Value vm_pop(VM *vm);
+MG_API void vm_init(VM *vm);
+MG_API void vm_free(VM *vm);
+MG_API VM *vm_new(void);
+MG_API void vm_delete(VM *vm);
+MG_API void vm_register_native(VM *vm, const char *name, NativeFn function,
+                               int arity, void *userdata,
+                               void (*userdata_finalizer)(void *));
+MG_API ObjFFI *vm_register_ffi(VM *vm, const char *name, void *c_func, int arity);
+MG_API ObjNativeHandle *vm_new_native_handle(
+    VM *vm, const char *type_name, void *data, NativeHandleFinalizer finalizer);
+MG_API bool vm_native_handle_set_method(
+    VM *vm, ObjNativeHandle *handle, const char *name, NativeFn function,
+    int arity, void *userdata, void (*userdata_finalizer)(void *));
+MG_API void *vm_native_handle_data(Value value, const char *type_name);
+MG_API Value vm_native_handle_value(ObjNativeHandle *handle);
+MG_API bool vm_set_global_value(VM *vm, const char *name, Value value);
+MG_API bool vm_get_global_value(VM *vm, const char *name, Value *out);
+MG_API InterpretResult vm_interpret(VM *vm, const char *source);
+MG_API InterpretResult vm_interpret_named(VM *vm, const char *source,
+                                          const char *name);
+MG_API InterpretResult vm_run_function(VM *vm, ObjFunction *function);
+MG_API ObjFunction *vm_compile(VM *vm, const char *source);
+MG_API ObjFunction *vm_compile_named(VM *vm, const char *source,
+                                     const char *name);
+MG_API bool vm_save_bytecode(VM *vm, ObjFunction *function, const char *path);
+MG_API ObjFunction *vm_load_bytecode(VM *vm, const char *path);
+MG_API void vm_push(VM *vm, Value value);
+MG_API Value vm_pop(VM *vm);
+MG_API VMRoot *vm_root_value(VM *vm, Value value);
+MG_API bool vm_root_set(VM *vm, VMRoot *root, Value value);
+MG_API Value vm_root_get(const VMRoot *root);
+MG_API void vm_unroot_value(VM *vm, VMRoot *root);
 
 /* Runtime error reporting */
-void vm_runtime_error(VM *vm, const char *format, ...);
-const char *vm_last_error(VM *vm);
-const char *vm_last_error_trace(VM *vm);
-int vm_last_error_line(VM *vm);
-const char *vm_last_error_file(VM *vm);
-const char *vm_last_error_function(VM *vm);
-void vm_clear_error(VM *vm);
+MG_API void vm_runtime_error(VM *vm, const char *format, ...);
+MG_API const char *vm_last_error(VM *vm);
+MG_API const char *vm_last_error_trace(VM *vm);
+MG_API int vm_last_error_line(VM *vm);
+MG_API const char *vm_last_error_file(VM *vm);
+MG_API const char *vm_last_error_function(VM *vm);
+MG_API void vm_clear_error(VM *vm);
 
 /* VM introspection (safe accessors that do not depend on struct layout) */
-int vm_frame_count(VM *vm);
-size_t vm_bytes_allocated(VM *vm);
+MG_API void mg_runtime_error_simple(VM *vm, const char *message);
+MG_API void *mg_get_native_userdata(VM *vm);
+MG_API int vm_frame_count(VM *vm);
+MG_API int vm_stack_top(VM *vm);
+MG_API size_t vm_bytes_allocated(VM *vm);
+MG_API bool vm_last_error_value(VM *vm, Value *out);
 
-/* String introspection: return chars/length of a string Value, or NULL/0
-   if the value is not a string or is a rope that has not been flattened. */
-const char *vm_string_chars(Value value);
-int vm_string_length(Value value);
-ObjFunction *compile_named(VM *vm, ASTNode *ast, const char *name, int name_len);
+/* String introspection. vm_string_chars() returns NULL for non-strings and
+   unflattened ropes; vm_string_length() always returns the logical byte
+   length of a string. Use the VM-aware helpers to flatten or copy safely. */
+MG_API const char *vm_string_chars(Value value);
+MG_API int vm_string_length(Value value);
+MG_API const char *vm_string_chars_resolved(VM *vm, Value value);
+MG_API bool vm_string_copy(VM *vm, Value value, char *buffer, size_t capacity,
+                           size_t *required);
+MG_API ObjFunction *compile_named(VM *vm, ASTNode *ast, const char *name,
+                                  int name_len);
 
 /* ========================================================================
  * Object Allocation (requires VM for GC tracking)
  * ======================================================================== */
-Obj *allocate_object(VM *vm, size_t size, ObjType type);
-ObjString *copy_string(VM *vm, const char *chars, int length);
-ObjString *take_string(VM *vm, char *chars, int length);
-ObjString *concat_strings(VM *vm, ObjString *a, ObjString *b);
-const char *string_chars(VM *vm, ObjString *string);
-char string_char_at(ObjString *string, int index);
-ObjFunction *new_function(VM *vm);
-ObjClosure *new_closure(VM *vm, ObjFunction *function);
-ObjUpvalue *new_upvalue(VM *vm, Value *slot);
-ObjNative *new_native(VM *vm, NativeFn function, const char *name, int arity);
-ObjFFI *new_ffi(VM *vm, void *c_func, const char *name, int arity);
-ObjNativeHandle *new_native_handle(VM *vm, ObjString *type_name, void *data,
-                                   NativeHandleFinalizer finalizer);
-ObjArray *new_array(VM *vm);
-ObjDict *new_dict(VM *vm);
-ObjStruct *new_struct(VM *vm, ObjString *name);
-ObjInstance *new_instance(VM *vm, ObjStruct *klass);
-ObjError *new_error(VM *vm, ObjString *kind, ObjString *message,
-                    ObjString *file, int line, ObjString *function,
-                    ObjString *hint);
-ObjVMTask *new_vm_task(VM *vm, const char *path);
-ObjCoroutine *new_coroutine(VM *vm, ObjClosure *closure);
-void vm_task_destroy(ObjVMTask *task);
+MG_API Obj *allocate_object(VM *vm, size_t size, ObjType type);
+MG_API ObjString *copy_string(VM *vm, const char *chars, int length);
+MG_API ObjString *take_string(VM *vm, char *chars, int length);
+MG_API ObjString *concat_strings(VM *vm, ObjString *a, ObjString *b);
+MG_API const char *string_chars(VM *vm, ObjString *string);
+MG_API char string_char_at(ObjString *string, int index);
+MG_API ObjFunction *new_function(VM *vm);
+MG_API ObjClosure *new_closure(VM *vm, ObjFunction *function);
+MG_API ObjUpvalue *new_upvalue(VM *vm, Value *slot);
+MG_API ObjNative *new_native(VM *vm, NativeFn function, ObjString *name,
+                             int arity);
+MG_API ObjFFI *new_ffi(VM *vm, void *c_func, ObjString *name, int arity);
+MG_API ObjNativeHandle *new_native_handle(VM *vm, ObjString *type_name,
+                                          void *data,
+                                          NativeHandleFinalizer finalizer);
+MG_API ObjArray *new_array(VM *vm);
+MG_API ObjDict *new_dict(VM *vm);
+MG_API ObjStruct *new_struct(VM *vm, ObjString *name);
+MG_API ObjInstance *new_instance(VM *vm, ObjStruct *klass);
+MG_API ObjError *new_error(VM *vm, ObjString *kind, ObjString *message,
+                           ObjString *file, int line, ObjString *function,
+                           ObjString *hint);
+MG_API ObjVMTask *new_vm_task(VM *vm, const char *path);
+MG_API ObjCoroutine *new_coroutine(VM *vm, ObjClosure *closure);
+MG_API void vm_task_destroy(ObjVMTask *task);
 
-void array_push(VM *vm, ObjArray *array, Value value);
-Value array_get(ObjArray *array, int index);
-void array_set(ObjArray *array, int index, Value value);
+MG_API void array_push(VM *vm, ObjArray *array, Value value);
+MG_API Value array_get(ObjArray *array, int index);
+MG_API void array_set(VM *vm, ObjArray *array, int index, Value value);
 
-bool dict_get(ObjDict *dict, ObjString *key, Value *value);
-bool dict_set(VM *vm, ObjDict *dict, ObjString *key, Value value);
+MG_API bool dict_get(ObjDict *dict, ObjString *key, Value *value);
+MG_API bool dict_set(VM *vm, ObjDict *dict, ObjString *key, Value value);
 DictEntry *dict_find_entry(ObjDict *dict, ObjString *key, int *entry_index, int *indices_slot);
-void dict_adjust_capacity(VM *vm, ObjDict *dict, int capacity);
-bool dict_delete(ObjDict *dict, ObjString *key);
+MG_API void dict_adjust_capacity(VM *vm, ObjDict *dict, int capacity);
+MG_API bool dict_delete(ObjDict *dict, ObjString *key);
 
 /* ========================================================================
  * Garbage Collector
  * ======================================================================== */
-void gc_minor_collect(VM *vm);
-void gc_major_collect(VM *vm);
-void remembered_set_add(VM *vm, Obj *old_obj);
+MG_API void gc_collect(VM *vm);
+MG_API void gc_minor_collect(VM *vm);
+MG_API void gc_major_collect(VM *vm);
+MG_API void remembered_set_add(VM *vm, Obj *old_obj);
 static inline void gc_write_barrier(VM *vm, Obj *old_obj, Value young_val) {
-    if (!old_obj->is_old) return;
     if (!IS_OBJ(young_val)) return;
+    if (!old_obj->is_old) return;
     Obj *val_obj = AS_OBJ(young_val);
     if (!val_obj->is_old) {
         remembered_set_add(vm, old_obj);
     }
 }
-void gc_mark_value(VM *vm, Value value);
-void gc_mark_object(VM *vm, Obj *object);
+MG_API void gc_mark_value(VM *vm, Value value);
+MG_API void gc_mark_object(VM *vm, Obj *object);
 
 /* ========================================================================
  * Lexer
  * ======================================================================== */
-void scanner_init(Scanner *scanner, const char *source);
-Token scan_token(Scanner *scanner);
+MG_API void scanner_init(Scanner *scanner, const char *source);
+MG_API Token scan_token(Scanner *scanner);
 
 /* ========================================================================
  * Parser (produces AST)
  * ======================================================================== */
-ASTNode *parse(const char *source, bool *had_error);
+MG_API ASTNode *parse(const char *source, bool *had_error);
 
 /* ========================================================================
  * Optimizer (AST -> AST)
  * ======================================================================== */
-void optimize_ast(ASTNode *node);
+MG_API void optimize_ast(ASTNode *node);
 
 /* ========================================================================
  * Compiler (AST -> Bytecode)
  * ======================================================================== */
-ObjFunction *compile(VM *vm, ASTNode *ast);
+MG_API ObjFunction *compile(VM *vm, ASTNode *ast);
 
 /* ========================================================================
  * Static Checker
  * ======================================================================== */
-bool mg_ast_has_nocheck(ASTNode *ast);
-bool mg_ast_has_strict(ASTNode *ast);
-bool mg_typecheck_ast(ASTNode *ast, bool force_check);
+MG_API bool mg_ast_has_nocheck(ASTNode *ast);
+MG_API bool mg_ast_has_strict(ASTNode *ast);
+MG_API bool mg_typecheck_ast(ASTNode *ast, bool force_check);
 
 /* ========================================================================
  * Debug (optional disassembly)
  * ======================================================================== */
-void disassemble_chunk(Chunk *chunk, const char *name);
-void disassemble_instruction(Chunk *chunk, int offset);
+MG_API void disassemble_chunk(Chunk *chunk, const char *name);
+MG_API void disassemble_instruction(Chunk *chunk, int offset);
 
 #endif /* MAGNESIUM_H */

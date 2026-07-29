@@ -8,8 +8,14 @@ extern "C" {
     pub fn vm_delete(vm: *mut VM);
     pub fn vm_init(vm: *mut VM);
     pub fn vm_free(vm: *mut VM);
-    pub fn vm_register_native(vm: *mut VM, name: *const c_char, function: NativeFn, arity: c_int,
-                              userdata: *mut c_void, userdata_finalizer: Option<unsafe extern "C" fn(data: *mut c_void)>);
+    pub fn vm_register_native(
+        vm: *mut VM,
+        name: *const c_char,
+        function: NativeFn,
+        arity: c_int,
+        userdata: *mut c_void,
+        userdata_finalizer: Option<unsafe extern "C" fn(data: *mut c_void)>,
+    );
     pub fn vm_register_ffi(
         vm: *mut VM,
         name: *const c_char,
@@ -41,6 +47,10 @@ extern "C" {
     pub fn vm_last_error_file(vm: *mut VM) -> *const c_char;
     pub fn vm_last_error_function(vm: *mut VM) -> *const c_char;
     pub fn vm_clear_error(vm: *mut VM);
+    pub fn vm_frame_count(vm: *mut VM) -> c_int;
+    pub fn vm_stack_top(vm: *mut VM) -> c_int;
+    pub fn vm_bytes_allocated(vm: *mut VM) -> size_t;
+    pub fn vm_last_error_value(vm: *mut VM, out: *mut Value) -> bool;
     pub fn vm_interpret(vm: *mut VM, source: *const c_char) -> InterpretResult;
     pub fn vm_interpret_named(
         vm: *mut VM,
@@ -58,8 +68,22 @@ extern "C" {
     pub fn vm_load_bytecode(vm: *mut VM, path: *const c_char) -> *mut ObjFunction;
     pub fn vm_push(vm: *mut VM, value: Value);
     pub fn vm_pop(vm: *mut VM) -> Value;
+    pub fn vm_root_value(vm: *mut VM, value: Value) -> *mut VMRoot;
+    pub fn vm_root_set(vm: *mut VM, root: *mut VMRoot, value: Value) -> bool;
+    pub fn vm_root_get(root: *const VMRoot) -> Value;
+    pub fn vm_unroot_value(vm: *mut VM, root: *mut VMRoot);
     pub fn mg_runtime_error_simple(vm: *mut VM, message: *const c_char);
     pub fn mg_get_native_userdata(vm: *mut VM) -> *mut c_void;
+    pub fn vm_string_chars(value: Value) -> *const c_char;
+    pub fn vm_string_length(value: Value) -> c_int;
+    pub fn vm_string_chars_resolved(vm: *mut VM, value: Value) -> *const c_char;
+    pub fn vm_string_copy(
+        vm: *mut VM,
+        value: Value,
+        buffer: *mut c_char,
+        capacity: size_t,
+        required: *mut size_t,
+    ) -> bool;
 
     // Compiler (AST -> Bytecode)
     pub fn compile_named(
@@ -82,13 +106,13 @@ extern "C" {
     pub fn new_native(
         vm: *mut VM,
         function: NativeFn,
-        name: *const c_char,
+        name: *mut ObjString,
         arity: c_int,
     ) -> *mut ObjNative;
     pub fn new_ffi(
         vm: *mut VM,
         c_func: *mut libc::c_void,
-        name: *const c_char,
+        name: *mut ObjString,
         arity: c_int,
     ) -> *mut ObjFFI;
     pub fn new_array(vm: *mut VM) -> *mut ObjArray;
@@ -111,7 +135,7 @@ extern "C" {
     // Array Operations
     pub fn array_push(vm: *mut VM, array: *mut ObjArray, value: Value);
     pub fn array_get(array: *mut ObjArray, index: c_int) -> Value;
-    pub fn array_set(array: *mut ObjArray, index: c_int, value: Value);
+    pub fn array_set(vm: *mut VM, array: *mut ObjArray, index: c_int, value: Value);
 
     // Dict Operations
     pub fn dict_get(dict: *mut ObjDict, key: *mut ObjString, value: *mut Value) -> bool;
@@ -140,6 +164,7 @@ extern "C" {
 
     // GC
     pub fn gc_collect(vm: *mut VM);
+    pub fn remembered_set_add(vm: *mut VM, old_obj: *mut Obj);
     pub fn gc_mark_value(vm: *mut VM, value: Value);
     pub fn gc_mark_object(vm: *mut VM, object: *mut Obj);
 

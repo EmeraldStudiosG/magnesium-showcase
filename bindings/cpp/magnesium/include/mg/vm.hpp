@@ -8,27 +8,48 @@
 #include <string>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace mg {
 
+class GcRoot;
+
 class Vm {
 public:
-    Vm() : raw_(vm_new()) {
+    Vm()
+        : raw_(vm_new()) {
         if (!raw_) throw std::runtime_error("failed to allocate VM");
+        try {
+            control_ = std::make_shared<VmControl>(VmControl{this, raw_});
+        } catch (...) {
+            vm_delete(raw_);
+            raw_ = nullptr;
+            throw;
+        }
     }
 
-    ~Vm() {
-        if (raw_) vm_delete(raw_);
-    }
+    ~Vm() { release(); }
 
     Vm(const Vm&) = delete;
     Vm& operator=(const Vm&) = delete;
-    Vm(Vm&& other) noexcept : raw_(other.raw_) { other.raw_ = nullptr; }
+    Vm(Vm&& other) noexcept
+        : raw_(other.raw_), control_(std::move(other.control_)) {
+        other.raw_ = nullptr;
+        if (control_) {
+            control_->owner = this;
+            control_->raw = raw_;
+        }
+    }
     Vm& operator=(Vm&& other) noexcept {
         if (this != &other) {
-            if (raw_) vm_delete(raw_);
+            release();
             raw_ = other.raw_;
             other.raw_ = nullptr;
+            control_ = std::move(other.control_);
+            if (control_) {
+                control_->owner = this;
+                control_->raw = raw_;
+            }
         }
         return *this;
     }
@@ -40,7 +61,7 @@ public:
         auto cs = cstr(source);
         if (!cs) return InterpretResult::host_error(HostError::interior_nul("source"));
         auto r = vm_interpret(raw_, cs->c_str());
-        return InterpretResult::from_raw(r);
+        return InterpretResult::from_raw_with_vm(r, raw_);
     }
 
     InterpretResult interpret_named(const std::string& source, const std::string& name) {
@@ -49,7 +70,7 @@ public:
         auto cn = cstr(name);
         if (!cn) return InterpretResult::host_error(HostError::interior_nul("name"));
         auto r = vm_interpret_named(raw_, cs->c_str(), cn->c_str());
-        return InterpretResult::from_raw(r);
+        return InterpretResult::from_raw_with_vm(r, raw_);
     }
 
     std::optional<::ObjFunction*> compile(const std::string& source) {
@@ -70,7 +91,7 @@ public:
 
     InterpretResult run_function(::ObjFunction* fn) {
         auto r = vm_run_function(raw_, fn);
-        return InterpretResult::from_raw(r);
+        return InterpretResult::from_raw_with_vm(r, raw_);
     }
 
     bool save_bytecode(::ObjFunction* fn, const std::string& path) {
@@ -125,7 +146,7 @@ public:
         auto cn = cstr(name);
         if (!cn) return;
 
-        auto* wrap = new NativeClosureWrap{this, std::move(f)};
+        auto* wrap = new NativeClosureWrap{control_, std::move(f)};
         vm_register_native(raw_, cn->c_str(), native_trampoline, arity,
                            static_cast<void*>(wrap), native_closure_finalizer);
     }
@@ -166,7 +187,7 @@ public:
         auto cm = cstr(method_name);
         if (!cm) return;
 
-        auto* mc = new MethodClosure<T>{this, type_name, std::move(f)};
+        auto* mc = new MethodClosure<T>{control_, type_name, std::move(f)};
         vm_native_handle_set_method(raw_, handle.as_native_handle(), cm->c_str(),
                                      method_trampoline<T>, arity,
                                      static_cast<void*>(mc), method_finalizer<T>);
@@ -192,25 +213,41 @@ public:
     }
 
     std::string last_error_message() const {
-        return raw_->last_error_message ? std::string(raw_->last_error_message) : "";
+        const char* message = vm_last_error(raw_);
+        return message ? std::string(message) : "";
     }
     std::string last_error_trace() const {
-        return raw_->last_error_trace ? std::string(raw_->last_error_trace) : "";
+        const char* trace = vm_last_error_trace(raw_);
+        return trace ? std::string(trace) : "";
     }
-    int32_t last_error_line() const { return raw_->last_error_line; }
-    void clear_error() { vm_clear_error(raw_); }
+    int32_t last_error_line() const { return vm_last_error_line(raw_); }
+    void clear_error() { if (raw_) vm_clear_error(raw_); }
 
-    int32_t frame_count() const { return raw_->frame_count; }
-    int32_t stack_top() const { return raw_->stack_top; }
-    size_t bytes_allocated() const { return raw_->bytes_allocated; }
+    int32_t frame_count() const { return vm_frame_count(raw_); }
+    int32_t stack_top() const { return vm_stack_top(raw_); }
+    size_t bytes_allocated() const { return vm_bytes_allocated(raw_); }
 
 private:
+    friend class GcRoot;
+
     std::optional<std::string> cstr(const std::string& s) {
         if (s.find('\0') != std::string::npos) return std::nullopt;
         return s;
     }
 
+    void release() noexcept {
+        if (control_) {
+            control_->owner = nullptr;
+            control_->raw = nullptr;
+        }
+        if (raw_) {
+            vm_delete(raw_);
+            raw_ = nullptr;
+        }
+    }
+
     ::VM* raw_;
+    std::shared_ptr<VmControl> control_;
 };
 
 } // namespace mg

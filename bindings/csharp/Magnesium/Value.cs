@@ -54,7 +54,7 @@ namespace Magnesium
 
         public bool IsNull => _bits == (QNAN | TAG_NULL);
         public bool IsBool => _bits == (QNAN | TAG_FALSE) || _bits == (QNAN | TAG_TRUE);
-        public bool IsInt => (_bits & (QNAN | 0x7UL)) == (QNAN | TAG_INT);
+        public bool IsInt => (_bits & (SIGN_BIT | QNAN | 0x7UL)) == (QNAN | TAG_INT);
 
         public bool IsNumber
         {
@@ -100,9 +100,12 @@ namespace Magnesium
             if (!IsString) return null;
             var charsPtr = Native.vm_string_chars(_bits);
             int length = Native.vm_string_length(_bits);
-            if (charsPtr == IntPtr.Zero || length <= 0) return null;
-            return Marshal.PtrToStringAnsi(charsPtr, length);
+            if (length == 0) return string.Empty;
+            if (charsPtr == IntPtr.Zero || length < 0) return null;
+            return Marshal.PtrToStringUTF8(charsPtr, length);
         }
+
+        public string? TryAsString(Vm vm) => vm.CopyString(this);
 
         public bool Equals(Value other) => _bits == other._bits;
         public override bool Equals(object? obj) => obj is Value v && Equals(v);

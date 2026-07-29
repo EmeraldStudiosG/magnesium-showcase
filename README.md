@@ -4,7 +4,7 @@
 
 Magnesium is an embeddable scripting language implemented from scratch in C11: lexer, recursive-descent parser, register-bytecode compiler, type checker, generational garbage collector, computed-goto VM, bytecode serializer with a static verifier, language server, VS Code extension, and safe bindings for Rust, C++, and C#. Roughly **17,000 lines of C** with no runtime dependencies beyond libc, libm, and pthreads.
 
-It is at **v1.0.0**, ships with a 52-program exact-output regression suite, a 16-benchmark cross-language harness (Magnesium vs. Lua 5.4, LuaJIT, and CPython), a 10-variant bytecode-loader fuzzer, and an end-to-end LSP smoke test covering every advertised capability.
+It is at **v1.1.0**, ships with a 59-program exact-output regression suite plus generated CLI edge cases, a strict 16-benchmark cross-language gate (Magnesium vs. Lua 5.4 and CPython), a 10-variant bytecode-loader fuzzer, and an end-to-end LSP smoke test covering every advertised capability.
 
 The design goal is **predictable performance without a JIT**: aggressive static bytecode specialization, typed inline caches, a generational collector, and a verifier that makes loading untrusted `.mgc` files safe. Lua is the embedding reference point, but Magnesium keeps arrays, dicts, structs, and enums as distinct types instead of one public table.
 
@@ -15,7 +15,7 @@ The design goal is **predictable performance without a JIT**: aggressive static 
 | Component | File | Lines | Description |
 | --- | --- | --- | --- |
 | VM | `src/vm.c` | 6,551 | Computed-goto dispatch loop, 121 opcodes, 4 inline caches, native/FFI calls, threads, coroutines |
-| Compiler | `src/compiler.c` | 4,204 | AST to bytecode, register allocator, peephole fusion, leaf-function inliner, loop-pattern detection |
+| Compiler | `src/compiler.c` | 4,204 | AST to bytecode, register allocator, peephole fusion, leaf-function inliner, control-flow lowering |
 | Parser | `src/parser.c` | 1,631 | Recursive descent + Pratt precedence, sub-scan for interpolated strings, panic-mode recovery |
 | Header | `src/magnesium.h` | 1,286 | NaN-boxing, opcode encoding, object model, GC layout, public C API |
 | LSP server | `src/lsp.c` | 1,756 | Hand-written LSP base protocol, no JSON library |
@@ -27,13 +27,13 @@ The design goal is **predictable performance without a JIT**: aggressive static 
 
 ### Notable implementation details
 
-- **Specialized opcode set.** The compiler pattern-matches AST shapes and emits fused multi-word instructions: `OP_ADDSUB` (ternary arithmetic in one opcode), `OP_ADD_GT_TEST` (compare-and-jump fused with arithmetic, validator at `src/serialize.c:529`), `OP_MULLOCAL_ADD` (in-place multiply-accumulate), and `OP_FOR_FIELD2_ACCUM`, which executes the body of a struct method as a batched loop update with hoisted type checks and amortized cancel checks every 4,096 iterations (`src/vm.c:4331`). The compiler recognizes the method body shape `(self.f0 = self.f0 + x; self.f1 = self.f1 + x)` at AST-walk time (`src/compiler.c:1290`) and routes every call inside a for-range to this opcode.
+- **General-purpose bytecode specialization.** The compiler lowers language-level arithmetic, collection, field, call, and control-flow operations into register bytecode using semantic and type information. The same lowering rules apply to every source file; the benchmark gate does not enable benchmark-only opcodes or runtime paths.
 
-- **Four direct-mapped inline caches with two different hash functions.** Globals (128 slots), struct fields (128), method dispatch (128), and dict keys (256). Field IC hashes `(klass ^ name>>4) & mask`; method IC hashes `(klass>>3 ^ name>>5) & mask`. Different hash functions on adjacent caches avoid same-slot collisions under workloads that touch fields and methods together (`src/vm.c:5689`, `src/vm.c:5705`). Dict gets an additional per-instance monomorphic slot checked before the VM-wide cache (`src/vm.c:2464`). ICs are only cleared on major collection.
+- **Four direct-mapped inline caches with two different hash functions.** Globals (128 slots), struct fields (128), method dispatch (128), and dict keys (256). Field IC hashes `(klass ^ name>>4) & mask`; method IC hashes `(klass>>3 ^ name>>5) & mask`. Different hash functions on adjacent caches avoid same-slot collisions under workloads that touch fields and methods together. Dict gets an additional per-instance monomorphic slot checked before the VM-wide cache. Weak cache entries are cleared before collections that could reclaim their objects.
 
 - **NaN-boxing with auto-promoting integers.** All values fit in 64 bits (`src/magnesium.h:128-171`). Numbers that happen to be integral and in `int32_t` range silently tag as `TAG_INT`, so the int+int fast path skips floating-point work entirely. `int_or_number` (`src/vm.c:2784`) promotes only on overflow: a chain of `int + int + int` stays int-register-resident until something overflows, then the whole chain degrades to float. No silent truncation, no heap traffic.
 
-- **Bytecode verifier.** `validate_function` (`src/serialize.c:236-596`) walks every instruction and checks register spans, constant-table indices with type tags, jump-target bounds (forward jumps must land in-chunk; loops must jump backward), arity limits, and multi-word instruction integrity. A `.mgc` file with `OP_FORADDLOCAL_FIELD_PROP` whose aux word was rewritten to `OP_RETURN` is rejected before any code executes. Size caps on every chunk (1 MiB instructions, 1 MiB constants, <=256 arity/upvalues/registers) prevent the loader from being coerced into a 4 GiB allocation, so loading bytecode from untrusted sources is safe.
+- **Bytecode verifier.** `validate_function` (`src/serialize.c`) walks every instruction and checks register spans, constant-table indices with type tags, jump-target bounds, arity limits, and multi-word instruction integrity. A `.mgc` file whose opcode or auxiliary word is rewritten to an invalid instruction is rejected before any code executes. Size caps on every chunk prevent malformed files from requesting unbounded allocations.
 
 - **Compile-time name resolution for globals.** An undefined global is a *compile* error, not a runtime one. The compiler seeds its global table from builtins and the host-registered globals (`src/compiler.c:427-435`) and rejects unknown identifiers upfront (`src/compiler.c:662`). It also tracks whether the program has shadowed `len`, `push`, `tostring`, etc. so the fast-path opcodes for those builtins can be safely disabled when the global has been redefined (`src/compiler.c:466`).
 
@@ -49,7 +49,7 @@ The design goal is **predictable performance without a JIT**: aggressive static 
 
 - **Per-call frame caching with `restrict` pointers.** The dispatch loop hoists `slots`, `ip`, `k` into `Value * restrict slots`, `Instruction * restrict ip`, `const Value * restrict k` (`src/vm.c:2870-2872`). Combined with ~140 `__builtin_expect` annotations on the hot path, the compiler keeps the interpreter state in registers across opcode handlers.
 
-- **MSVC is intentionally not supported.** The dispatch loop relies on labels-as-values (computed `goto`), a GNU C extension. The `Makefile` (`Makefile:7-13`) detects this at configure time and errors out with a clear message pointing to LLVM-MinGW. The same source still compiles under a switch-fallback path for compilers without the extension; the trade-off is documented.
+- **MSVC is intentionally not supported.** The dispatch loop relies on labels-as-values (computed `goto`), supported by GCC and Clang but not MSVC. The `Makefile` detects an unsupported Windows compiler early and points to a Clang-based toolchain.
 
 ---
 
@@ -123,7 +123,10 @@ The C API is the low-level boundary:
 
 ```c
 typedef Value (*NativeFn)(VM *vm, int arg_count, Value *args);
-void vm_register_native(VM *vm, const char *name, NativeFn function, int arity);
+void vm_register_native(
+    VM *vm, const char *name, NativeFn function, int arity,
+    void *userdata, void (*userdata_finalizer)(void *)
+);
 ```
 
 Three layers above it: native functions (registered by the host), native handles (for host-owned resources like file handles, scene nodes, or ECS handles, with optional finalizers), and raw numeric FFI for narrow C function-pointer calls.
@@ -146,7 +149,7 @@ print(MAX_SCORE)
 
 **C++**: Header-only (`#include <mg/magnesium.hpp>`), C++17, built with CMake. `mg::Value` is `static_assert(sizeof(Value) == sizeof(uint64_t))`-checked. `mg::Vm` supports move semantics; native functions register via `std::function`-backed trampolines; native methods are template-parameterized by the host type so `set_native_handle_method_fn<Entity>` reuses a single `MethodClosure<T>` specialization.
 
-**C#**: .NET 8, P/Invoke, `AllowUnsafeBlocks`. `Value` is a `readonly struct` over a `ulong`. The trampoline pins `NativeClosureWrap` via `GCHandle.Alloc` and reads the args buffer through `ulong*` pointer arithmetic. `~Vm()` finalizer is the safety net for unmanaged lifetime.
+**C#**: .NET 8, P/Invoke, `AllowUnsafeBlocks`. `Value` is a `readonly struct` over a `ulong`. Native delegates are retained for the VM lifetime, managed exceptions are contained at the reverse P/Invoke boundary, and `GcRoot` keeps host-held values alive across VM collections. `~Vm()` is the safety net for unmanaged lifetime.
 
 Full embedding reference: [`docs/src/reference/embedding.md`](docs/src/reference/embedding.md).
 
@@ -169,19 +172,19 @@ Diagnostics spawn a fresh VM, compile the open document, and parse the compiler'
 ## Testing and benchmarks
 
 ```bash
-make test                # full 52-test .mg suite + 10-variant bytecode fuzzer
+make test                # 59 .mg tests + CLI/native-API regressions + bytecode fuzzer
 make test-verbose        # same, with per-test diff
 make test-ubsan         # full suite under UBSan with halt_on_error=1
 make test-asan          # targeted ASan/leak smoke test
 make test-asan-full     # full suite under ASan + leak detection + UBSan
-make bench              # 16 benchmarks across Magnesium / Lua 5.4 / LuaJIT / CPython
+make bench              # strict 16-benchmark Magnesium / Lua 5.4 / CPython gate
 ```
 
 The **test harness** (`scripts/run_tests.sh`) runs every `tests/test_*.mg`, captures combined stdout+stderr, strips CRLF for cross-platform stability, and asserts exact-output match against `tests/expected/<name>.expected`. Negative tests are written to fail at runtime; the assertion is on error *text*, not exit code, so deterministic error messages are part of the spec.
 
 The **bytecode fuzzer** (`scripts/run_bytecode_tests.sh`) compiles two valid `.mgc` files, then mutates ten specific fields: magic bytes, trailing bytes, truncation, register count forced to 257, invalid opcodes, invalid register indices, invalid value tags, invalid constant indices, invalid jump targets. It asserts the loader rejects each variant with `Could not load bytecode` before executing any code.
 
-The **benchmark suite** covers both source and bytecode modes across Magnesium, Lua 5.4, LuaJIT, and CPython 3. Sixteen benchmarks: `fib35`, `binary_trees` (depth-18 GC pressure), `sieve` (1M-element array), `mandelbrot` (400x400), `dict_bench` (250k insert/lookup), `call_loop` (10M function calls), `closure_loop` (5M upvalue mutations), `object_fields` (1M struct-field dispatches), `gc_alloc` (50kx50 arrays), `fallible_lookup` (3M `?` operator), `native_len` (5M FFI calls), `coroutine_switch` (200k resume/yield), and four more. The Dockerfile at `Dockerfile.bench` builds a clean Ubuntu 24.04 environment with all four runtimes pinned so benchmarks are reproducible.
+The **benchmark suite** covers both source and bytecode modes across Magnesium, Lua 5.4, and CPython 3. It first checks equivalent output, stages the runtime and sources on the native temporary filesystem, performs one warmup, and measures five runs. The release gate compares medians and exits nonzero unless Magnesium is strictly faster than both reference runtimes for every benchmark in both modes. Sixteen benchmarks: `fib35`, `binary_trees` (depth-18 GC pressure), `sieve` (1M-element array), `mandelbrot` (400x400), `dict_bench` (250k insert/lookup), `call_loop` (10M function calls), `closure_loop` (5M upvalue mutations), `object_fields` (1M struct-field dispatches), `gc_alloc` (50kx50 arrays), `fallible_lookup` (3M `?` operator), `native_len` (5M native calls), `coroutine_switch` (200k resume/yield), and four more. `Dockerfile.bench` provides a clean Ubuntu 24.04 environment with Lua 5.4, CPython, and the low-overhead timeout dependency.
 
 ---
 
@@ -196,7 +199,7 @@ The **benchmark suite** covers both source and bytecode modes across Magnesium, 
 | `lsp/magnesium-vscode/` | VS Code extension: TextMate grammar, dark theme, language client. |
 | `docs/` | mdBook source for *The Magnesium Book*. |
 | `examples/` | Sample `.mg` programs including a full feature showcase. |
-| `tests/` + `tests/expected/` | 52 end-to-end `.mg` tests with exact expected outputs. |
+| `tests/` + `tests/expected/` | 59 end-to-end `.mg` tests with exact expected outputs. |
 | `benchmark/` | 16 cross-language benchmarks in source and compiled form. |
 | `scripts/` | `run_tests.sh`, `run_bytecode_tests.sh`, `run_bench.sh` / `.ps1`, `serve_docs.sh` / `.ps1`, `lsp_smoke.py`. |
 | `Makefile`, `install.sh`, `install.ps1` | Build, installers. |
@@ -206,15 +209,15 @@ The **benchmark suite** covers both source and bytecode modes across Magnesium, 
 
 ## Status
 
-Magnesium is at v1.0.0 and actively maintained. The docs describe the current implementation unless a section explicitly states it is a design note. See [`docs/src/CHANGELOG.md`](docs/src/CHANGELOG.md) for release notes.
+Magnesium is at v1.1.0 and actively maintained. The docs describe the current implementation unless a section explicitly states it is a design note. See [`docs/src/CHANGELOG.md`](docs/src/CHANGELOG.md) for release notes.
 
 ## Contributors
 
-- **İsmail Kuzey Pulat** - Developed and mapped out the entire codebase from scratch.
+- **Ismail Kuzey Pulat** - Developed and mapped out the entire codebase from scratch.
 - thekingofdespair - Created the mascot Flow.
 - regretted - Testing the language.
 - The authors of the various research papers and institutions whose work on VM and interpreter performance informed Magnesium's design.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE). Copyright (c) 2026 İsmail Kuzey Pulat.
+MIT. See [`LICENSE`](LICENSE). Copyright (c) 2026 Ismail Kuzey Pulat.

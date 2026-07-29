@@ -37,6 +37,11 @@ Rules:
 
 The C API is the low-level embedding boundary. It is intentionally explicit and should be treated as unsafe by host code.
 
+When a native C or C++ host links `libmagnesium.dll`, define
+`MG_USE_SHARED` before including `magnesium.h`. The library build defines
+`MG_BUILD_SHARED` itself so `MG_API` exports the supported embedding ABI.
+Neither definition is needed for static builds or on Unix-like platforms.
+
 Native functions use this shape:
 
 ```c
@@ -46,10 +51,22 @@ typedef Value (*NativeFn)(VM *vm, int arg_count, Value *args);
 Register a native function with:
 
 ```c
-void vm_register_native(VM *vm, const char *name, NativeFn function, int arity);
+void vm_register_native(
+    VM *vm,
+    const char *name,
+    NativeFn function,
+    int arity,
+    void *userdata,
+    void (*userdata_finalizer)(void *)
+);
 ```
 
-Native functions receive raw VM values. They are responsible for checking argument count and value kinds before reading arguments.
+Pass `NULL, NULL` when the callback has no userdata. Native functions receive
+raw VM values. They are responsible for checking argument count and value kinds
+before reading arguments. The `args` array remains stable and GC-rooted for the
+duration of the callback, including across `vm_push()` calls and collections.
+Do not retain the pointer or its unrooted object values after the callback
+returns; use `vm_root_value()` for values the host must keep.
 
 Native handles attach host-owned data to script-visible values:
 
@@ -66,7 +83,9 @@ bool vm_native_handle_set_method(
     ObjNativeHandle *handle,
     const char *name,
     NativeFn function,
-    int arity
+    int arity,
+    void *userdata,
+    void (*userdata_finalizer)(void *)
 );
 ```
 
@@ -117,11 +136,17 @@ Static checking can be run directly by the host:
 let ok = vm.try_type_check(source, true)?;
 ```
 
-Use native functions when the host needs full control over arguments and return values:
+Use the safe closure API for native functions:
 
 ```rust
-vm.try_register_native("host_call", Some(host_call), 2)?;
+use magnesium::Value;
+
+vm.register_native_fn("host_add", 2, |ctx| {
+    Value::auto_val(ctx.expect_numeric(0) + ctx.expect_numeric(1))
+})?;
 ```
+
+The raw `try_register_native` and `register_native` methods are `unsafe`: the caller must provide a callback with the exact C ABI and uphold the raw value and lifetime contracts.
 
 Use numeric FFI only for simple numeric functions:
 
@@ -157,8 +182,8 @@ int main() {
 extern const MAX_SCORE: number
 print(MAX_SCORE)
 )mg");
-    if (!result.ok) {
-        std::cerr << result.error.message << "\n";
+    if (result.is_err()) {
+        std::cerr << result.error().to_string() << "\n";
         return 1;
     }
 }
@@ -178,20 +203,33 @@ Native handles wrap host-owned data:
 
 ```cpp
 struct Entity { double x, y; };
-Entity e{10.0, 20.0};
-auto handle = vm.new_native_handle("Entity", &e);
-vm.set_native_handle_method(handle, "get_x", 0, [](mg::NativeContext& ctx) {
-    auto* e = static_cast<Entity*>(mg::vm_native_handle_data(ctx.args()[0].as_obj(), "Entity"));
-    return mg::Value::number_val(e->x);
-});
+auto handle = vm.new_native_handle_t<Entity>(
+    "Entity", std::make_unique<Entity>(Entity{10.0, 20.0}));
+vm.set_native_handle_method_fn<Entity>(
+    handle, "Entity", "get_x", 1,
+    [](Entity& entity, mg::NativeContext&) {
+        return mg::Value::number_val(entity.x);
+    });
 ```
+
+Keep host-held object values alive across collections with `mg::GcRoot`:
+
+```cpp
+auto array = vm.new_array_value();
+mg::GcRoot root(vm, array);
+mg::gc_collect(vm);
+assert(root.get().is_array());
+```
+
+Roots follow their VM through move construction or move assignment. If a root
+outlives the VM, it becomes inert: `get()` returns null, `set()` returns false,
+and destruction never calls into the released VM.
 
 CMake integration:
 
 ```cmake
-set(Magnesium_DIR "/path/to/bindings/cpp")
-find_package(Magnesium REQUIRED)
-target_link_libraries(your_target magnesium)
+add_subdirectory("/path/to/magnesium/bindings/cpp" magnesium-bindings)
+target_link_libraries(your_target PRIVATE magnesium)
 ```
 
 ## C# Bindings
@@ -229,7 +267,7 @@ Register native functions:
 vm.RegisterNativeFn("double", 1, ctx => Value.AutoVal(ctx.ExpectNumeric(0) * 2.0));
 ```
 
-Native handles use `GCHandle` for managed object pinning:
+Native handles use `GCHandle` to retain managed objects until the VM releases the handle:
 
 ```csharp
 var obj = new CounterObj { Value = 42 };

@@ -10,6 +10,8 @@
 #include <ctype.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #include "magnesium.h"
 
@@ -39,10 +41,47 @@ static Value native_coroutine_resume(VM *vm, int arg_count, Value *args);
 static Value native_coroutine_yield(VM *vm, int arg_count, Value *args);
 static Value native_coroutine_status(VM *vm, int arg_count, Value *args);
 static inline void ensure_stack(VM *vm, int needed);
+static void clear_upvalue_cache(VM *vm);
+static void close_upvalues(VM *vm, Value *last);
 static inline bool dict_get_cached_at(VM *vm, ObjDict *dict, ObjString *key,
                                       uint32_t slot, Value *out);
 static inline bool dict_get_cached(VM *vm, ObjDict *dict, ObjString *key, Value *out);
 static inline bool dict_get_mono_cached(ObjDict *dict, ObjString *key, Value *out);
+
+#if defined(_MSC_VER)
+#define MG_NOINLINE __declspec(noinline)
+#define MG_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define MG_NOINLINE __attribute__((noinline))
+#define MG_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define MG_NOINLINE
+#define MG_ALWAYS_INLINE inline
+#endif
+
+static MG_NOINLINE Value invoke_native_with_stable_args(
+    VM *vm, ObjNative *native, int arg_count, Value *args) {
+    if (arg_count < 0 || arg_count > MAX_REGISTERS) {
+        vm_runtime_error(vm, "Native argument count %d is out of range.", arg_count);
+        return NULL_VAL;
+    }
+
+    Value stable_args[MAX_REGISTERS];
+    memcpy(stable_args, args, sizeof(Value) * (size_t)arg_count);
+    NativeArgRoot root = {stable_args, arg_count, vm->native_arg_roots};
+    vm->native_arg_roots = &root;
+    Value result = native->function(vm, arg_count, stable_args);
+    vm->native_arg_roots = root.previous;
+    return result;
+}
+
+static inline Value invoke_native(VM *vm, ObjNative *native,
+                                  int arg_count, Value *args) {
+    if (__builtin_expect(!native->copy_args || arg_count == 0, 1)) {
+        return native->function(vm, arg_count, args);
+    }
+    return invoke_native_with_stable_args(vm, native, arg_count, args);
+}
 
 /* ========================================================================
  * Native Functions
@@ -82,10 +121,84 @@ static const char *value_type_name(Value value) {
     return "object";
 }
 
+/* Convert a language number to a C index/count without invoking undefined
+   behavior for NaN, infinities, or values outside the C int range. */
+static bool numeric_to_int(Value value, int *out) {
+    if (!out || !IS_NUMERIC(value)) return false;
+    if (IS_INT(value)) {
+        *out = AS_INT(value);
+        return true;
+    }
+    double number = AS_DOUBLE(value);
+    if (!isfinite(number) || number < (double)INT32_MIN ||
+        number > (double)INT32_MAX) {
+        return false;
+    }
+    *out = (int)number;
+    return true;
+}
+
+static inline int32_t int32_mod_nonzero(int32_t a, int32_t b) {
+    return (a == INT32_MIN && b == -1) ? 0 : a % b;
+}
+
+#if defined(__SIZEOF_INT128__) && __SIZEOF_INT128__ >= 16
+#define MG_FASTMOD_RECIPROCAL(divisor) \
+    (UINT64_MAX / (uint64_t)(divisor) + UINT64_C(1))
+static const uint64_t fastmod_reciprocal[] = {
+    0,
+    MG_FASTMOD_RECIPROCAL(1),  MG_FASTMOD_RECIPROCAL(2),
+    MG_FASTMOD_RECIPROCAL(3),  MG_FASTMOD_RECIPROCAL(4),
+    MG_FASTMOD_RECIPROCAL(5),  MG_FASTMOD_RECIPROCAL(6),
+    MG_FASTMOD_RECIPROCAL(7),  MG_FASTMOD_RECIPROCAL(8),
+    MG_FASTMOD_RECIPROCAL(9),  MG_FASTMOD_RECIPROCAL(10),
+    MG_FASTMOD_RECIPROCAL(11), MG_FASTMOD_RECIPROCAL(12),
+    MG_FASTMOD_RECIPROCAL(13), MG_FASTMOD_RECIPROCAL(14),
+    MG_FASTMOD_RECIPROCAL(15), MG_FASTMOD_RECIPROCAL(16),
+};
+#undef MG_FASTMOD_RECIPROCAL
+#endif
+
+static MG_ALWAYS_INLINE int32_t int32_mod_immediate_nonzero(int32_t value,
+                                                            int32_t divisor) {
+#if defined(__SIZEOF_INT128__) && __SIZEOF_INT128__ >= 16
+    uint32_t divisor_magnitude =
+        divisor < 0 ? (uint32_t)(-(int64_t)divisor) : (uint32_t)divisor;
+    if (__builtin_expect(divisor_magnitude <= 16, 1)) {
+        uint32_t value_magnitude =
+            value < 0 ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+        uint64_t low = fastmod_reciprocal[divisor_magnitude] *
+                       (uint64_t)value_magnitude;
+        uint32_t remainder = (uint32_t)(
+            ((unsigned __int128)low * divisor_magnitude) >> 64);
+        return value < 0 ? -(int32_t)remainder : (int32_t)remainder;
+    }
+#endif
+    return int32_mod_nonzero(value, divisor);
+}
+
+static bool range_iteration_count(double start, double limit, bool inclusive,
+                                  long long *count, double *final_value) {
+    if (!isfinite(start) || !isfinite(limit) || !count || !final_value) {
+        return false;
+    }
+    long double delta = (long double)limit - (long double)start;
+    long double iterations = 0;
+    if (inclusive) {
+        if (start <= limit) iterations = floorl(delta) + 1;
+    } else if (start < limit) {
+        iterations = ceill(delta);
+    }
+    if (iterations < 0 || iterations > (long double)LLONG_MAX) return false;
+    *count = (long long)iterations;
+    *final_value = start + (double)*count;
+    return isfinite(*final_value);
+}
+
 static bool ffi_read_number_arg(VM *vm, ObjFFI *ffi, int index, Value value, double *out) {
     if (!IS_NUMERIC(value)) {
         vm_runtime_error(vm, "FFI %s argument %d expected number, got %s.",
-                         ffi->name, index + 1, value_type_name(value));
+                         ffi->name->chars, index + 1, value_type_name(value));
         return false;
     }
     *out = AS_NUMBER(value);
@@ -142,12 +255,21 @@ static int current_line_number(VM *vm) {
 
 static Value make_error_value(VM *vm, const char *kind, const char *message, const char *hint) {
     ObjString *kind_str = copy_string(vm, kind, (int)strlen(kind));
+    vm_push(vm, OBJ_VAL(kind_str));
     ObjString *message_str = copy_string(vm, message, (int)strlen(message));
+    vm_push(vm, OBJ_VAL(message_str));
     ObjString *hint_str = hint ? copy_string(vm, hint, (int)strlen(hint)) : NULL;
+    vm_push(vm, hint_str ? OBJ_VAL(hint_str) : NULL_VAL);
     ObjString *file = current_file_name(vm);
+    vm_push(vm, OBJ_VAL(file));
     ObjString *function = current_function_name(vm);
-    return OBJ_VAL(new_error(vm, kind_str, message_str, file,
-                             current_line_number(vm), function, hint_str));
+    vm_push(vm, OBJ_VAL(function));
+    ObjError *error = new_error(vm, kind_str, message_str, file,
+                                current_line_number(vm), function, hint_str);
+    for (int i = 0; i < 5; i++) {
+        vm_pop(vm);
+    }
+    return OBJ_VAL(error);
 }
 
 static Value make_errorf_value(VM *vm, const char *kind, const char *hint,
@@ -195,11 +317,11 @@ static Value native_type(VM *vm, int arg_count, Value *args) {
 }
 
 static Value error_to_string(VM *vm, ObjError *err) {
-    const char *kind = err->kind ? err->kind->chars : "Error";
-    const char *message = err->message ? err->message->chars : "";
-    const char *file = err->file ? err->file->chars : "<unknown>";
-    const char *function = err->function ? err->function->chars : "<unknown>";
-    const char *hint = err->hint ? err->hint->chars : "";
+    const char *kind = err->kind ? string_chars(vm, err->kind) : "Error";
+    const char *message = err->message ? string_chars(vm, err->message) : "";
+    const char *file = err->file ? string_chars(vm, err->file) : "<unknown>";
+    const char *function = err->function ? string_chars(vm, err->function) : "<unknown>";
+    const char *hint = err->hint ? string_chars(vm, err->hint) : "";
     int needed = snprintf(NULL, 0, "error[%s]: %s\n  at %s:%d in %s%s%s",
                           kind, message, file, err->line, function,
                           hint[0] ? "\n  hint: " : "",
@@ -226,6 +348,13 @@ static Value value_to_string(VM *vm, Value value) {
     if (IS_INT(value)) {
         int32_t num = AS_INT(value);
         if ((uint32_t)num < INT_STR_CACHE_SIZE) {
+            if (vm->int_str_cache == NULL) {
+                vm->int_str_cache = (ObjString **)calloc(
+                    INT_STR_CACHE_SIZE, sizeof(ObjString *));
+            }
+        }
+        if ((uint32_t)num < INT_STR_CACHE_SIZE &&
+            vm->int_str_cache != NULL) {
             ObjString *cached = vm->int_str_cache[num];
             if (cached != NULL) return OBJ_VAL(cached);
             uint32_t whole = (uint32_t)num;
@@ -240,7 +369,21 @@ static Value value_to_string(VM *vm, Value value) {
                 buf[pos++] = tmp[len - i - 1];
             }
             ObjString *s = copy_string(vm, buf, pos);
-            vm->int_str_cache[num] = s;
+            if (vm->int_str_cache_used_count >= vm->int_str_cache_used_capacity) {
+                int old_capacity = vm->int_str_cache_used_capacity;
+                int new_capacity = old_capacity < 16 ? 16 : old_capacity * 2;
+                uint32_t *used = (uint32_t *)realloc(
+                    vm->int_str_cache_used,
+                    sizeof(uint32_t) * (size_t)new_capacity);
+                if (used) {
+                    vm->int_str_cache_used = used;
+                    vm->int_str_cache_used_capacity = new_capacity;
+                }
+            }
+            if (vm->int_str_cache_used_count < vm->int_str_cache_used_capacity) {
+                vm->int_str_cache[num] = s;
+                vm->int_str_cache_used[vm->int_str_cache_used_count++] = (uint32_t)num;
+            }
             return OBJ_VAL(s);
         }
         uint32_t whole = num < 0 ? (uint32_t)(-(int64_t)num) : (uint32_t)num;
@@ -259,29 +402,11 @@ static Value value_to_string(VM *vm, Value value) {
     }
     if (IS_NUMBER(value)) {
         double num = AS_NUMBER(value);
-        if (num != 0.0 || !signbit(num)) {
-            double abs_num = num < 0.0 ? -num : num;
-            if (abs_num <= 9007199254740991.0) {
-                uint64_t whole = (uint64_t)abs_num;
-                if ((double)whole == abs_num) {
-                char tmp[32];
-                int len = 0;
-                do {
-                    tmp[len++] = (char)('0' + (whole % 10));
-                    whole /= 10;
-                } while (whole != 0);
-                    int pos = 0;
-                    if (num < 0.0) {
-                        buf[pos++] = '-';
-                    }
-                    for (int i = 0; i < len; i++) {
-                        buf[pos++] = tmp[len - i - 1];
-                    }
-                    return OBJ_VAL(copy_string(vm, buf, pos));
-                }
-            }
+        int len = format_number(buf, sizeof(buf), num);
+        if (len < 0 || (size_t)len >= sizeof(buf)) {
+            vm_runtime_error(vm, "Could not format number.");
+            return NULL_VAL;
         }
-        int len = snprintf(buf, sizeof(buf), "%g", num);
         return OBJ_VAL(copy_string(vm, buf, len));
     }
     if (IS_OBJ(value)) {
@@ -307,20 +432,33 @@ static Value native_Err(VM *vm, int arg_count, Value *args) {
     if (arg_count == 3) {
         if (!require_string(vm, "Err", args[2], &hint)) return NULL_VAL;
     }
-    return OBJ_VAL(new_error(vm, kind, message, current_file_name(vm),
-                             current_line_number(vm), current_function_name(vm), hint));
+    ObjString *file = current_file_name(vm);
+    vm_push(vm, OBJ_VAL(file));
+    ObjString *function = current_function_name(vm);
+    vm_push(vm, OBJ_VAL(function));
+    ObjError *error = new_error(vm, kind, message, file,
+                                current_line_number(vm), function, hint);
+    vm_pop(vm);
+    vm_pop(vm);
+    return OBJ_VAL(error);
 }
 
 static Value native_tonumber(VM *vm, int arg_count, Value *args) {
-    (void)vm;
     if (arg_count != 1) return NULL_VAL;
     if (IS_NUMERIC(args[0])) return args[0];
     if (IS_STRING(args[0])) {
         ObjString *string = AS_STRING(args[0]);
         const char *chars = string_chars(vm, string);
         char *end;
+        errno = 0;
         double val = strtod(chars, &end);
-        if (end != chars) return NUMBER_VAL(val);
+        while (end < chars + string->length &&
+               isspace((unsigned char)*end)) {
+            end++;
+        }
+        if (end != chars && end == chars + string->length && errno != ERANGE) {
+            return NUMBER_VAL(val);
+        }
     }
     return NULL_VAL;
 }
@@ -419,13 +557,44 @@ static Value native_input(VM *vm, int arg_count, Value *args) {
         fflush(stdout);
     }
 
-    char buffer[4096];
-    if (!fgets(buffer, sizeof(buffer), stdin)) return NULL_VAL;
-    int len = (int)strlen(buffer);
-    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r')) {
-        len--;
+    size_t capacity = 128;
+    size_t length = 0;
+    char *buffer = (char *)malloc(capacity);
+    if (!buffer) {
+        vm_runtime_error(vm, "Out of memory reading input.");
+        return NULL_VAL;
     }
-    return OBJ_VAL(copy_string(vm, buffer, len));
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+        if (length + 1 >= capacity) {
+            if (capacity > (size_t)INT32_MAX / 2) {
+                free(buffer);
+                vm_runtime_error(vm, "Input line is too large.");
+                return NULL_VAL;
+            }
+            capacity *= 2;
+            char *grown = (char *)realloc(buffer, capacity);
+            if (!grown) {
+                free(buffer);
+                vm_runtime_error(vm, "Out of memory reading input.");
+                return NULL_VAL;
+            }
+            buffer = grown;
+        }
+        buffer[length++] = (char)ch;
+    }
+    if (ch == EOF && ferror(stdin)) {
+        free(buffer);
+        vm_runtime_error(vm, "Could not read input.");
+        return NULL_VAL;
+    }
+    if (ch == EOF && length == 0) {
+        free(buffer);
+        return NULL_VAL;
+    }
+    if (length > 0 && buffer[length - 1] == '\r') length--;
+    buffer[length] = '\0';
+    return OBJ_VAL(take_string(vm, buffer, (int)length));
 }
 
 static Value native_io_write(VM *vm, int arg_count, Value *args) {
@@ -631,15 +800,15 @@ static Value native_string_upper(VM *vm, int arg_count, Value *args) {
 
 static Value native_string_sub(VM *vm, int arg_count, Value *args) {
     ObjString *s;
-    double start_num;
     if (!require_args(vm, "string.sub", arg_count, 2, 3) ||
-        !require_string(vm, "string.sub", args[0], &s) ||
-        !require_number(vm, "string.sub", args[1], &start_num)) return NULL_VAL;
-    double end_num = (double)s->length;
-    if (arg_count == 3 && !require_number(vm, "string.sub", args[2], &end_num)) return NULL_VAL;
-
-    int start = (int)start_num;
-    int end = (int)end_num;
+        !require_string(vm, "string.sub", args[0], &s)) return NULL_VAL;
+    int start;
+    int end = s->length;
+    if (!numeric_to_int(args[1], &start) ||
+        (arg_count == 3 && !numeric_to_int(args[2], &end))) {
+        vm_runtime_error(vm, "string.sub indexes must be finite numbers in range.");
+        return NULL_VAL;
+    }
     if (start < 0) start = s->length + start + 1;
     if (end < 0) end = s->length + end + 1;
     if (start < 1) start = 1;
@@ -657,13 +826,14 @@ static Value native_string_find(VM *vm, int arg_count, Value *args) {
         !require_string(vm, "string.find", args[1], &needle)) return NULL_VAL;
     int start = 1;
     if (arg_count == 3) {
-        double n;
-        if (!require_number(vm, "string.find", args[2], &n)) return NULL_VAL;
-        start = (int)n;
+        if (!numeric_to_int(args[2], &start)) {
+            vm_runtime_error(vm, "string.find start index must be a finite number in range.");
+            return NULL_VAL;
+        }
         if (start < 0) start = s->length + start + 1;
     }
     if (start < 1) start = 1;
-    if (start > s->length + 1) return NULL_VAL;
+    if (start > s->length && start - 1 > s->length) return NULL_VAL;
     const char *chars = string_chars(vm, s);
     const char *needle_chars = string_chars(vm, needle);
     const char *found = find_bytes(chars + start - 1, s->length - start + 1,
@@ -690,9 +860,10 @@ static Value native_string_byte(VM *vm, int arg_count, Value *args) {
         !require_string(vm, "string.byte", args[0], &s)) return NULL_VAL;
     int index = 1;
     if (arg_count == 2) {
-        double n;
-        if (!require_number(vm, "string.byte", args[1], &n)) return NULL_VAL;
-        index = (int)n;
+        if (!numeric_to_int(args[1], &index)) {
+            vm_runtime_error(vm, "string.byte index must be a finite number in range.");
+            return NULL_VAL;
+        }
         if (index < 0) index = s->length + index + 1;
     }
     if (index < 1 || index > s->length) return NULL_VAL;
@@ -707,12 +878,12 @@ static Value native_string_char(VM *vm, int arg_count, Value *args) {
         return NULL_VAL;
     }
     for (int i = 0; i < arg_count; i++) {
-        double n;
-        if (!require_number(vm, "string.char", args[i], &n)) {
+        int byte;
+        if (!numeric_to_int(args[i], &byte)) {
             free(out);
+            vm_runtime_error(vm, "string.char expected finite byte values.");
             return NULL_VAL;
         }
-        int byte = (int)n;
         if (byte < 0 || byte > 255) {
             free(out);
             vm_runtime_error(vm, "string.char expected byte values from 0 to 255.");
@@ -790,11 +961,13 @@ static Value native_string_ends_with(VM *vm, int arg_count, Value *args) {
 
 static Value native_string_repeat(VM *vm, int arg_count, Value *args) {
     ObjString *s;
-    double n;
     if (!require_args(vm, "string.repeat", arg_count, 2, 2) ||
-        !require_string(vm, "string.repeat", args[0], &s) ||
-        !require_number(vm, "string.repeat", args[1], &n)) return NULL_VAL;
-    int count = (int)n;
+        !require_string(vm, "string.repeat", args[0], &s)) return NULL_VAL;
+    int count;
+    if (!numeric_to_int(args[1], &count)) {
+        vm_runtime_error(vm, "string.repeat count must be a finite number in range.");
+        return NULL_VAL;
+    }
     if (count <= 0 || s->length == 0) return OBJ_VAL(copy_string(vm, "", 0));
     if (s->length > INT32_MAX / count) {
         vm_runtime_error(vm, "string.repeat result is too large.");
@@ -855,7 +1028,13 @@ static Value native_string_replace(VM *vm, int arg_count, Value *args) {
     }
     if (count == 0) return args[0];
 
-    int len = s->length + count * (replacement->length - needle->length);
+    int64_t result_length = (int64_t)s->length +
+        (int64_t)count * (replacement->length - needle->length);
+    if (result_length < 0 || result_length > INT32_MAX) {
+        vm_runtime_error(vm, "string.replace result is too large.");
+        return NULL_VAL;
+    }
+    int len = (int)result_length;
     char *out = (char *)malloc((size_t)len + 1);
     if (!out) {
         vm_runtime_error(vm, "Out of memory in string.replace.");
@@ -895,7 +1074,11 @@ static Value native_string_at(VM *vm, int arg_count, Value *args) {
                                 "String indexes are zero-based.");
     }
     ObjString *s = AS_STRING(args[0]);
-    int index = IS_INT(args[1]) ? AS_INT(args[1]) : (int)AS_DOUBLE(args[1]);
+    int index;
+    if (!numeric_to_int(args[1], &index)) {
+        return make_error_value(vm, "IndexError", "String index is outside the supported range",
+                                "Use a finite index within the string length.");
+    }
     if (index < 0) index = s->length + index;
     if (index < 0 || index >= s->length) {
         return make_error_value(vm, "IndexError", "String index out of range",
@@ -933,21 +1116,28 @@ static Value native_array_insert(VM *vm, int arg_count, Value *args) {
     if (!require_args(vm, "array.insert", arg_count, 2, 3) ||
         !require_array(vm, "array.insert", args[0], &array)) return NULL_VAL;
 
-    int index = array->count + 1;
+    if (array->count == INT_MAX) {
+        vm_runtime_error(vm, "array.insert cannot grow an array beyond INT_MAX elements.");
+        return NULL_VAL;
+    }
+    int append_index = array->count + 1;
+    int index = append_index;
     Value value = args[1];
     if (arg_count == 3) {
-        double n;
-        if (!require_number(vm, "array.insert", args[1], &n)) return NULL_VAL;
-        index = (int)n;
+        if (!numeric_to_int(args[1], &index)) {
+            vm_runtime_error(vm, "array.insert index must be a finite number in range.");
+            return NULL_VAL;
+        }
         value = args[2];
     }
     if (index < 1) index = 1;
-    if (index > array->count + 1) index = array->count + 1;
+    if (index > append_index) index = append_index;
     array_push(vm, array, NULL_VAL);
     for (int i = array->count - 1; i > index - 1; i--) {
         array->items[i] = array->items[i - 1];
     }
     array->items[index - 1] = value;
+    gc_write_barrier(vm, (Obj *)array, value);
     return NULL_VAL;
 }
 
@@ -958,9 +1148,10 @@ static Value native_array_remove(VM *vm, int arg_count, Value *args) {
     if (array->count == 0) return NULL_VAL;
     int index = array->count;
     if (arg_count == 2) {
-        double n;
-        if (!require_number(vm, "array.remove", args[1], &n)) return NULL_VAL;
-        index = (int)n;
+        if (!numeric_to_int(args[1], &index)) {
+            vm_runtime_error(vm, "array.remove index must be a finite number in range.");
+            return NULL_VAL;
+        }
     }
     if (index < 1 || index > array->count) return NULL_VAL;
     Value value = array->items[index - 1];
@@ -985,7 +1176,11 @@ static Value native_array_get(VM *vm, int arg_count, Value *args) {
                                 "Array indexes are zero-based.");
     }
     ObjArray *array = AS_ARRAY(args[0]);
-    int index = IS_INT(args[1]) ? AS_INT(args[1]) : (int)AS_DOUBLE(args[1]);
+    int index;
+    if (!numeric_to_int(args[1], &index)) {
+        return make_error_value(vm, "IndexError", "Array index is outside the supported range",
+                                "Use a finite index within the array length.");
+    }
     if (index < 0) index = array->count + index;
     if (index < 0 || index >= array->count) {
         return make_error_value(vm, "IndexError", "Array index out of range",
@@ -1045,7 +1240,8 @@ static Value native_array_extend(VM *vm, int arg_count, Value *args) {
     if (!require_args(vm, "array.extend", arg_count, 2, 2) ||
         !require_array(vm, "array.extend", args[0], &array) ||
         !require_array(vm, "array.extend", args[1], &other)) return NULL_VAL;
-    for (int i = 0; i < other->count; i++) {
+    int source_count = other->count;
+    for (int i = 0; i < source_count; i++) {
         array_push(vm, array, other->items[i]);
     }
     return args[0];
@@ -1053,15 +1249,15 @@ static Value native_array_extend(VM *vm, int arg_count, Value *args) {
 
 static Value native_array_slice(VM *vm, int arg_count, Value *args) {
     ObjArray *array;
-    double start_num;
     if (!require_args(vm, "array.slice", arg_count, 2, 3) ||
-        !require_array(vm, "array.slice", args[0], &array) ||
-        !require_number(vm, "array.slice", args[1], &start_num)) return NULL_VAL;
-    double end_num = (double)array->count;
-    if (arg_count == 3 && !require_number(vm, "array.slice", args[2], &end_num)) return NULL_VAL;
-
-    int start = (int)start_num;
-    int end = (int)end_num;
+        !require_array(vm, "array.slice", args[0], &array)) return NULL_VAL;
+    int start;
+    int end = array->count;
+    if (!numeric_to_int(args[1], &start) ||
+        (arg_count == 3 && !numeric_to_int(args[2], &end))) {
+        vm_runtime_error(vm, "array.slice indexes must be finite numbers in range.");
+        return NULL_VAL;
+    }
     if (start < 0) start = array->count + start;
     if (end < 0) end = array->count + end;
     if (start < 0) start = 0;
@@ -1202,7 +1398,7 @@ static Value native_dict_clear(VM *vm, int arg_count, Value *args) {
     dict->version++;
     dict->mono_cache_key = NULL;
     dict->mono_cache_entry = NULL;
-    dict->mono_cache_version = 0;
+    dict->mono_cache_value = NULL_VAL;
     return NULL_VAL;
 }
 
@@ -1281,7 +1477,8 @@ static bool path_ends_with(const char *path, const char *suffix) {
            memcmp(path + path_len - suffix_len, suffix, suffix_len) == 0;
 }
 
-static bool read_file_buffer(const char *path, char **out, char *err, size_t err_size) {
+static bool read_file_buffer(const char *path, char **out, size_t *out_len,
+                             char *err, size_t err_size) {
     FILE *file = fopen(path, "rb");
     if (!file) {
         snprintf(err, err_size, "Could not open file: %s", path);
@@ -1295,6 +1492,11 @@ static bool read_file_buffer(const char *path, char **out, char *err, size_t err
     long size = ftell(file);
     if (size < 0) {
         snprintf(err, err_size, "Could not read file size: %s", path);
+        fclose(file);
+        return false;
+    }
+    if ((unsigned long)size > (unsigned long)INT32_MAX) {
+        snprintf(err, err_size, "File is too large to load: %s", path);
         fclose(file);
         return false;
     }
@@ -1316,6 +1518,7 @@ static bool read_file_buffer(const char *path, char **out, char *err, size_t err
     buffer[read] = '\0';
     fclose(file);
     *out = buffer;
+    if (out_len) *out_len = read;
     return true;
 }
 
@@ -1346,10 +1549,12 @@ static Value native_fs_read(VM *vm, int arg_count, Value *args) {
     ObjString *path = AS_STRING(args[0]);
     char err[512];
     char *buffer = NULL;
-    if (!read_file_buffer(string_chars(vm, path), &buffer, err, sizeof(err))) {
+    size_t buffer_len = 0;
+    if (!read_file_buffer(string_chars(vm, path), &buffer, &buffer_len,
+                          err, sizeof(err))) {
         return make_error_value(vm, "IOError", err, "Pass a readable file path.");
     }
-    return OBJ_VAL(take_string(vm, buffer, (int)strlen(buffer)));
+    return OBJ_VAL(take_string(vm, buffer, (int)buffer_len));
 }
 
 static Value native_fs_write_common(VM *vm, int arg_count, Value *args, bool append,
@@ -1382,10 +1587,8 @@ static Value native_fs_exists(VM *vm, int arg_count, Value *args) {
         return make_error_value(vm, "TypeError", "fs.exists expected a string path",
                                 "Call fs.exists(path).");
     }
-    FILE *file = fopen(string_chars(vm, AS_STRING(args[0])), "rb");
-    if (!file) return FALSE_VAL;
-    fclose(file);
-    return TRUE_VAL;
+    struct stat info;
+    return BOOL_VAL(stat(string_chars(vm, AS_STRING(args[0])), &info) == 0);
 }
 
 static Value native_fs_remove(VM *vm, int arg_count, Value *args) {
@@ -1465,7 +1668,12 @@ static Value native_path_join(VM *vm, int arg_count, Value *args) {
             return make_error_value(vm, "TypeError", "path.join expected only string parts",
                                     "Pass path fragments as strings.");
         }
-        total += (size_t)AS_STRING(args[i])->length + 1;
+        size_t part_size = (size_t)AS_STRING(args[i])->length + 1;
+        if (part_size > (size_t)INT_MAX - total) {
+            return make_error_value(vm, "RangeError", "path.join result is too large",
+                                    "Join fewer or shorter path fragments.");
+        }
+        total += part_size;
     }
     char *buffer = (char *)malloc(total + 1);
     if (!buffer) {
@@ -1561,6 +1769,7 @@ static void run_isolated_path(ObjVMTask *task, int *result,
 
     VM child;
     vm_init(&child);
+    child.suppress_error_output = true;
     MG_ATOMIC_STORE_BOOL(child.cancel_requested,
                          MG_ATOMIC_LOAD_BOOL(task->cancel_requested));
 
@@ -1597,13 +1806,26 @@ static void run_isolated_path(ObjVMTask *task, int *result,
     } else {
         char err_buf[512];
         char *source = NULL;
-        if (!read_file_buffer(path, &source, err_buf, sizeof(err_buf))) {
+        size_t source_len = 0;
+        if (!read_file_buffer(path, &source, &source_len, err_buf, sizeof(err_buf))) {
             vm_task_detach_child(task, &child);
             vm_free(&child);
             *result = INTERPRET_RUNTIME_ERROR;
             snprintf(kind, kind_size, "IOError");
             snprintf(message, message_size, "%s", err_buf);
             snprintf(hint, hint_size, "Pass a readable Magnesium script path.");
+            return;
+        }
+        if (memchr(source, '\0', source_len) != NULL) {
+            free(source);
+            vm_task_detach_child(task, &child);
+            vm_free(&child);
+            *result = INTERPRET_RUNTIME_ERROR;
+            snprintf(kind, kind_size, "CompileError");
+            snprintf(message, message_size,
+                     "Source file contains an embedded NUL byte: %s", path);
+            snprintf(hint, hint_size,
+                     "Remove the NUL byte before running the child script.");
             return;
         }
         ObjFunction *function = vm_compile_named(&child, source, path);
@@ -1622,6 +1844,8 @@ static void run_isolated_path(ObjVMTask *task, int *result,
     }
 
     bool cancelled = vm_task_detach_child(task, &child);
+    char child_error[sizeof(child.last_error_message)];
+    snprintf(child_error, sizeof(child_error), "%s", child.last_error_message);
 
     vm_free(&child);
     *result = run_result;
@@ -1636,7 +1860,11 @@ static void run_isolated_path(ObjVMTask *task, int *result,
         snprintf(hint, hint_size, "Run the child script directly for the compiler diagnostic.");
     } else if (run_result == INTERPRET_RUNTIME_ERROR) {
         snprintf(kind, kind_size, "RuntimeError");
-        snprintf(message, message_size, "Isolated VM script failed at runtime: %s", path);
+        if (child_error[0] != '\0') {
+            snprintf(message, message_size, "%s", child_error);
+        } else {
+            snprintf(message, message_size, "Isolated VM script failed at runtime: %s", path);
+        }
         snprintf(hint, hint_size, "Run the child script directly for the runtime diagnostic.");
     }
 }
@@ -1891,11 +2119,10 @@ static Value native_vm_join(VM *vm, int arg_count, Value *args) {
     }
     int timeout_ms = -1;
     if (arg_count == 2) {
-        if (!IS_NUMERIC(args[1])) {
-            return make_error_value(vm, "TypeError", "vm.join timeout must be a number",
-                                    "Pass a timeout in milliseconds.");
+        if (!numeric_to_int(args[1], &timeout_ms) || timeout_ms < 0) {
+            return make_error_value(vm, "RangeError", "vm.join timeout is outside the supported range",
+                                    "Pass a non-negative timeout in milliseconds.");
         }
-        timeout_ms = (int)AS_NUMBER(args[1]);
         if (timeout_ms < 0) timeout_ms = 0;
     }
 
@@ -1979,18 +2206,22 @@ static Value native_vm_try_join(VM *vm, int arg_count, Value *args) {
 }
 
 static void define_native_with_userdata(VM *vm, const char *name, NativeFn function, int arity,
-                                        void *userdata, void (*userdata_finalizer)(void *)) {
+                                        void *userdata, void (*userdata_finalizer)(void *),
+                                        bool copy_args) {
     ObjString *str = copy_string(vm, name, (int)strlen(name));
-    ObjNative *native = new_native(vm, function, str->chars, arity);
+    vm_push(vm, OBJ_VAL(str));
+    ObjNative *native = new_native(vm, function, str, arity);
+    native->copy_args = copy_args;
     native->userdata = userdata;
     native->userdata_finalizer = userdata_finalizer;
     vm_push(vm, OBJ_VAL(native));
     table_set(&vm->globals, str, OBJ_VAL(native));
     vm_pop(vm);
+    vm_pop(vm);
 }
 
 static void define_native(VM *vm, const char *name, NativeFn function, int arity) {
-    define_native_with_userdata(vm, name, function, arity, NULL, NULL);
+    define_native_with_userdata(vm, name, function, arity, NULL, NULL, false);
 }
 
 static void define_global_value(VM *vm, const char *name, Value value) {
@@ -2003,9 +2234,12 @@ static void define_global_value(VM *vm, const char *name, Value value) {
 static void define_native_field(VM *vm, ObjDict *dict, const char *name,
                                 NativeFn function, int arity) {
     ObjString *key = copy_string(vm, name, (int)strlen(name));
-    ObjNative *native = new_native(vm, function, key->chars, arity);
+    vm_push(vm, OBJ_VAL(key));
+    ObjNative *native = new_native(vm, function, key, arity);
+    native->copy_args = false;
     vm_push(vm, OBJ_VAL(native));
     dict_set(vm, dict, key, OBJ_VAL(native));
+    vm_pop(vm);
     vm_pop(vm);
 }
 
@@ -2147,8 +2381,13 @@ static void install_stdlib(VM *vm) {
 
 static Value native___ffi_bind(VM *vm, int arg_count, Value *args) {
     if (arg_count != 2 || !IS_STRING(args[0]) || !IS_NUMERIC(args[1])) return NULL_VAL;
-    const char *name = string_chars(vm, AS_STRING(args[0]));
-    int arity = (int)AS_NUMBER(args[1]);
+    ObjString *name_string = AS_STRING(args[0]);
+    const char *name = string_chars(vm, name_string);
+    int arity;
+    if (!numeric_to_int(args[1], &arity) || (arity != 1 && arity != 2)) {
+        vm_runtime_error(vm, "FFI arity must be 1 or 2.");
+        return NULL_VAL;
+    }
     
 #ifdef _WIN32
     HMODULE modules[4];
@@ -2176,7 +2415,7 @@ static Value native___ffi_bind(VM *vm, int arg_count, Value *args) {
         return NULL_VAL;
     }
 #endif
-    return OBJ_VAL(new_ffi(vm, ptr, name, arity));
+    return OBJ_VAL(new_ffi(vm, ptr, name_string, arity));
 }
 
 static Value native___builtin_spawn(VM *vm, int arg_count, Value *args) {
@@ -2184,14 +2423,19 @@ static Value native___builtin_spawn(VM *vm, int arg_count, Value *args) {
 
     if (vm->task_queue.count >= vm->task_queue.capacity) {
         int old_capacity = vm->task_queue.capacity;
-        vm->task_queue.capacity = old_capacity < 8 ? 8 : old_capacity * 2;
+        if (old_capacity > INT_MAX / 2) {
+            vm_runtime_error(vm, "Too many scheduled tasks.");
+            return NULL_VAL;
+        }
+        int new_capacity = old_capacity < 8 ? 8 : old_capacity * 2;
         ObjClosure **items = realloc(vm->task_queue.items,
-            sizeof(ObjClosure *) * vm->task_queue.capacity);
+            sizeof(ObjClosure *) * (size_t)new_capacity);
         if (!items) {
             vm_runtime_error(vm, "Out of memory scheduling task.");
             return NULL_VAL;
         }
         vm->task_queue.items = items;
+        vm->task_queue.capacity = new_capacity;
     }
 
     vm->task_queue.items[vm->task_queue.count++] = AS_CLOSURE(args[0]);
@@ -2225,6 +2469,8 @@ void vm_init(VM *vm) {
     table_init(&vm->modules);
     table_init(&vm->strings);
     vm->open_upvalues = NULL;
+    vm->host_roots = NULL;
+    vm->native_arg_roots = NULL;
     vm->current_coroutine = NULL;
     vm->yield_requested = false;
     vm->yield_count = 0;
@@ -2253,11 +2499,10 @@ void vm_init(VM *vm) {
     vm->upvalue_free_list = NULL;
     vm->closure_free_list_count = 0;
     vm->upvalue_free_list_count = 0;
-    vm->int_str_cache = (ObjString **)calloc(INT_STR_CACHE_SIZE, sizeof(ObjString *));
-    if (!vm->int_str_cache) {
-        fprintf(stderr, "Out of memory initializing integer string cache.\n");
-        exit(1);
-    }
+    vm->int_str_cache = NULL;
+    vm->int_str_cache_used = NULL;
+    vm->int_str_cache_used_count = 0;
+    vm->int_str_cache_used_capacity = 0;
     vm->young_objects = NULL;
     vm->old_objects = NULL;
     vm->bytes_allocated = 0;
@@ -2294,6 +2539,20 @@ void vm_init(VM *vm) {
 }
 
 void vm_free(VM *vm) {
+    if (!vm) return;
+    for (int i = 0; i < vm->vm_tasks.count; i++) {
+        vm_task_request_cancel(vm->vm_tasks.items[i]);
+    }
+    for (int i = 0; i < vm->vm_tasks.count; i++) {
+        vm_task_join_if_needed(vm->vm_tasks.items[i]);
+    }
+    VMRoot *root = vm->host_roots;
+    while (root) {
+        VMRoot *next = root->next;
+        free(root);
+        root = next;
+    }
+    vm->host_roots = NULL;
     table_free(&vm->globals);
     table_free(&vm->modules);
     table_free(&vm->strings);
@@ -2304,23 +2563,13 @@ void vm_free(VM *vm) {
     free(vm->vm_tasks.items);
     free(vm->gray_stack);
     free(vm->int_str_cache);
+    free(vm->int_str_cache_used);
     gc_free_all(vm);
 }
 
 void vm_push(VM *vm, Value value) {
-    if (vm->stack_size >= vm->stack_capacity) {
-        int old_capacity = vm->stack_capacity;
-        vm->stack_capacity *= 2;
-        Value *new_stack = realloc(vm->stack, sizeof(Value) * vm->stack_capacity);
-        if (!new_stack) {
-            fprintf(stderr, "Out of memory growing VM stack.\n");
-            exit(1);
-        }
-        vm->stack = new_stack;
-        for (int i = old_capacity; i < vm->stack_capacity; i++) {
-            vm->stack[i] = NULL_VAL;
-        }
-    }
+    if (!vm) return;
+    ensure_stack(vm, vm->stack_size + 1);
     vm->stack[vm->stack_size++] = value;
     if (vm->stack_size > vm->stack_top) {
         vm->stack_top = vm->stack_size;
@@ -2328,7 +2577,7 @@ void vm_push(VM *vm, Value value) {
 }
 
 Value vm_pop(VM *vm) {
-    if (vm->stack_size == 0) return NULL_VAL;
+    if (!vm || vm->stack_size == 0) return NULL_VAL;
     Value value = vm->stack[--vm->stack_size];
     vm->stack[vm->stack_size] = NULL_VAL;
     if (vm->stack_top > vm->stack_size) {
@@ -2337,14 +2586,55 @@ Value vm_pop(VM *vm) {
     return value;
 }
 
+VMRoot *vm_root_value(VM *vm, Value value) {
+    if (!vm) return NULL;
+    VMRoot *root = (VMRoot *)malloc(sizeof(VMRoot));
+    if (!root) return NULL;
+    root->value = value;
+    root->next = vm->host_roots;
+    vm->host_roots = root;
+    return root;
+}
+
+bool vm_root_set(VM *vm, VMRoot *root, Value value) {
+    if (!vm || !root) return false;
+    for (VMRoot *current = vm->host_roots; current; current = current->next) {
+        if (current == root) {
+            current->value = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+Value vm_root_get(const VMRoot *root) {
+    return root ? root->value : NULL_VAL;
+}
+
+void vm_unroot_value(VM *vm, VMRoot *root) {
+    if (!vm || !root) return;
+    VMRoot **link = &vm->host_roots;
+    while (*link) {
+        if (*link == root) {
+            *link = root->next;
+            free(root);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
 void vm_runtime_error(VM *vm, const char *format, ...) {
+    if (!vm || !format) return;
     va_list args;
     va_start(args, format);
     vsnprintf(vm->last_error_message, sizeof(vm->last_error_message), format, args);
     va_end(args);
 
-    fprintf(stderr, "%s", vm->last_error_message);
-    fputs("\n", stderr);
+    if (!vm->suppress_error_output) {
+        fprintf(stderr, "%s", vm->last_error_message);
+        fputs("\n", stderr);
+    }
 
     vm->last_error_trace[0] = '\0';
     vm->last_error_file[0] = '\0';
@@ -2356,13 +2646,19 @@ void vm_runtime_error(VM *vm, const char *format, ...) {
         CallFrame *frame = &vm->frames[i];
         ObjFunction *fn = frame->closure->function;
         int offset = (int)(frame->ip - fn->chunk.code - 1);
-        int line = fn->chunk.lines[offset >= 0 ? offset : 0];
-        const char *fn_name = fn->name ? fn->name->chars : "script";
+        int line = 0;
+        if (fn->chunk.count > 0 && fn->chunk.lines) {
+            if (offset < 0) offset = 0;
+            if (offset >= fn->chunk.count) offset = fn->chunk.count - 1;
+            line = fn->chunk.lines[offset];
+        }
+        const char *fn_name = fn->name ? string_chars(vm, fn->name) : "script";
         if (i == vm->frame_count - 1) {
             vm->last_error_line = line;
             snprintf(vm->last_error_function, sizeof(vm->last_error_function), "%s", fn_name);
             if (fn->source_name) {
-                normalize_path_copy(vm->last_error_file, sizeof(vm->last_error_file), fn->source_name->chars);
+                normalize_path_copy(vm->last_error_file, sizeof(vm->last_error_file),
+                                    string_chars(vm, fn->source_name));
             }
         }
         size_t used = strlen(vm->last_error_trace);
@@ -2372,38 +2668,42 @@ void vm_runtime_error(VM *vm, const char *format, ...) {
             snprintf(vm->last_error_trace + used, sizeof(vm->last_error_trace) - used,
                      "[line %d] in %s()\n", line, display_fn);
         }
-        fprintf(stderr, "[line %d] in ", line);
-        if (fn->name) {
-            char display_name[512];
-            normalize_path_copy(display_name, sizeof(display_name), fn->name->chars);
-            fprintf(stderr, "%s()\n", display_name);
-        } else {
-            fprintf(stderr, "script\n");
+        if (!vm->suppress_error_output) {
+            fprintf(stderr, "[line %d] in ", line);
+            if (fn->name) {
+                char display_name[512];
+                normalize_path_copy(display_name, sizeof(display_name),
+                                    string_chars(vm, fn->name));
+                fprintf(stderr, "%s()\n", display_name);
+            } else {
+                fprintf(stderr, "script\n");
+            }
         }
     }
 }
 
 const char *vm_last_error(VM *vm) {
-    return vm->last_error_message;
+    return vm ? vm->last_error_message : "";
 }
 
 const char *vm_last_error_trace(VM *vm) {
-    return vm->last_error_trace;
+    return vm ? vm->last_error_trace : "";
 }
 
 int vm_last_error_line(VM *vm) {
-    return vm->last_error_line;
+    return vm ? vm->last_error_line : 0;
 }
 
 const char *vm_last_error_file(VM *vm) {
-    return vm->last_error_file;
+    return vm ? vm->last_error_file : "";
 }
 
 const char *vm_last_error_function(VM *vm) {
-    return vm->last_error_function;
+    return vm ? vm->last_error_function : "";
 }
 
 void vm_clear_error(VM *vm) {
+    if (!vm) return;
     vm->last_error_message[0] = '\0';
     vm->last_error_trace[0] = '\0';
     vm->last_error_file[0] = '\0';
@@ -2413,25 +2713,57 @@ void vm_clear_error(VM *vm) {
 
 /* Ensure stack has room for n more values starting at index */
 static inline void ensure_stack(VM *vm, int needed) {
+    if (!vm || needed <= 0) return;
     if (vm->stack_capacity >= needed) return;
-    while (vm->stack_capacity < needed) {
-        int old_cap = vm->stack_capacity;
-        vm->stack_capacity *= 2;
-        Value *new_stack = realloc(vm->stack, sizeof(Value) * vm->stack_capacity);
-        if (!new_stack) {
-            fprintf(stderr, "Out of memory growing VM stack.\n");
+    int old_capacity = vm->stack_capacity;
+    int new_capacity = old_capacity > 0 ? old_capacity : STACK_INIT_SIZE;
+    while (new_capacity < needed) {
+        if (new_capacity > INT32_MAX / 2) {
+            fprintf(stderr, "VM stack is too large.\n");
             exit(1);
         }
-        /* Update all slot pointers in call frames */
-        if (new_stack != vm->stack) {
-            for (int i = 0; i < vm->frame_count; i++) {
-                vm->frames[i].slots = new_stack + (vm->frames[i].slots - vm->stack);
+        new_capacity *= 2;
+    }
+
+    Value *old_stack = vm->stack;
+    bool is_coroutine_stack =
+        vm->current_coroutine && vm->current_coroutine->stack == old_stack;
+    uintptr_t old_begin = (uintptr_t)old_stack;
+    uintptr_t old_end = old_begin + sizeof(Value) * (size_t)old_capacity;
+    Value *new_stack = realloc(old_stack, sizeof(Value) * (size_t)new_capacity);
+    if (!new_stack) {
+        fprintf(stderr, "Out of memory growing VM stack.\n");
+        exit(1);
+    }
+
+    if (new_stack != old_stack) {
+        uintptr_t new_begin = (uintptr_t)new_stack;
+        for (int i = 0; i < vm->frame_count; i++) {
+            uintptr_t slot = (uintptr_t)vm->frames[i].slots;
+            if (slot >= old_begin && slot < old_end) {
+                vm->frames[i].slots =
+                    (Value *)(new_begin + (slot - old_begin));
             }
         }
-        vm->stack = new_stack;
-        for (int i = old_cap; i < vm->stack_capacity; i++) {
-            vm->stack[i] = NULL_VAL;
+        for (ObjUpvalue *upvalue = vm->open_upvalues; upvalue; upvalue = upvalue->next) {
+            uintptr_t location = (uintptr_t)upvalue->location;
+            if (location >= old_begin && location < old_end) {
+                upvalue->location =
+                    (Value *)(new_begin + (location - old_begin));
+            }
         }
+        clear_upvalue_cache(vm);
+    }
+    if (is_coroutine_stack) {
+        vm->current_coroutine->stack = new_stack;
+        vm->current_coroutine->stack_capacity = new_capacity;
+        vm->bytes_allocated +=
+            sizeof(Value) * (size_t)(new_capacity - old_capacity);
+    }
+    vm->stack = new_stack;
+    vm->stack_capacity = new_capacity;
+    for (int i = old_capacity; i < new_capacity; i++) {
+        vm->stack[i] = NULL_VAL;
     }
 }
 
@@ -2461,17 +2793,9 @@ static inline bool dict_key_equal_fast(ObjString *a, ObjString *b) {
     return true;
 }
 
-static inline bool dict_get_mono_cached(ObjDict *dict, ObjString *key, Value *out) {
-    if (__builtin_expect(dict->mono_cache_key == key &&
-                         dict->mono_cache_version == dict->version &&
-                         dict->mono_cache_entry != NULL, 1)) {
-        DictEntry *entry = dict->mono_cache_entry;
-        if (__builtin_expect(entry->key == key, 1)) {
-            *out = entry->value;
-            return true;
-        }
-    }
-
+static MG_NOINLINE bool dict_get_mono_cached_slow(ObjDict *dict,
+                                                   ObjString *key,
+                                                   Value *out) {
     if (__builtin_expect(dict->count == 0 || dict->capacity == 0, 0)) return false;
 
     uint32_t key_hash = key->hash;
@@ -2482,9 +2806,9 @@ static inline bool dict_get_mono_cached(ObjDict *dict, ObjString *key, Value *ou
         if (slot > 0) {
             DictEntry *entry = &dict->entries[slot - 1];
             if (entry->hash == key_hash && entry->key != TOMBSTONE_KEY && dict_key_equal_fast(entry->key, key)) {
-                dict->mono_cache_key = key;
+                dict->mono_cache_key = entry->key;
                 dict->mono_cache_entry = entry;
-                dict->mono_cache_version = dict->version;
+                dict->mono_cache_value = entry->value;
                 *out = entry->value;
                 return true;
             }
@@ -2493,28 +2817,31 @@ static inline bool dict_get_mono_cached(ObjDict *dict, ObjString *key, Value *ou
     }
 }
 
-static inline bool dict_get_cached_at(VM *vm, ObjDict *dict, ObjString *key,
-                                      uint32_t slot, Value *out) {
-    if (__builtin_expect(dict->count == 0 || dict->capacity == 0, 0)) return false;
-    DictICEntry *ic = &vm->dict_ic[slot];
-    if (__builtin_expect(ic->dict == dict && ic->key == key &&
-                         ic->version == dict->version &&
-                         ic->entry != NULL, 1)) {
-        DictEntry *entry = ic->entry;
-        if (__builtin_expect(entry->key == key, 1)) {
-            *out = entry->value;
-            return true;
-        }
+static MG_ALWAYS_INLINE bool dict_get_mono_cached(ObjDict *dict,
+                                                   ObjString *key,
+                                                   Value *out) {
+    if (__builtin_expect(dict->mono_cache_key == key, 1)) {
+        *out = dict->mono_cache_value;
+        return true;
     }
+    return dict_get_mono_cached_slow(dict, key, out);
+}
 
+static MG_NOINLINE bool dict_get_cached_at_slow(VM *vm, ObjDict *dict,
+                                                 ObjString *key,
+                                                 uint32_t cache_slot,
+                                                 Value *out) {
+    if (__builtin_expect(dict->count == 0 || dict->capacity == 0, 0)) return false;
+    DictICEntry *ic = &vm->dict_ic[cache_slot];
     uint32_t key_hash = key->hash;
     uint32_t index = key_hash & (dict->capacity - 1);
     for (;;) {
-        int32_t slot = dict->indices[index];
-        if (slot == 0) return false;
-        if (slot > 0) {
-            DictEntry *entry = &dict->entries[slot - 1];
-            if (entry->hash == key_hash && entry->key != TOMBSTONE_KEY && dict_key_equal_fast(entry->key, key)) {
+        int32_t entry_slot = dict->indices[index];
+        if (entry_slot == 0) return false;
+        if (entry_slot > 0) {
+            DictEntry *entry = &dict->entries[entry_slot - 1];
+            if (entry->hash == key_hash && entry->key != TOMBSTONE_KEY &&
+                dict_key_equal_fast(entry->key, key)) {
                 ic->dict = dict;
                 ic->key = key;
                 ic->version = dict->version;
@@ -2528,12 +2855,111 @@ static inline bool dict_get_cached_at(VM *vm, ObjDict *dict, ObjString *key,
     }
 }
 
+static MG_ALWAYS_INLINE bool dict_get_cached_at(VM *vm, ObjDict *dict,
+                                                 ObjString *key,
+                                                 uint32_t slot, Value *out) {
+    DictICEntry *ic = &vm->dict_ic[slot];
+    if (__builtin_expect(ic->dict == dict && ic->key == key &&
+                         ic->version == dict->version &&
+                         ic->entry != NULL, 1)) {
+        DictEntry *entry = ic->entry;
+        if (__builtin_expect(entry->key == key, 1)) {
+            *out = entry->value;
+            return true;
+        }
+    }
+    return dict_get_cached_at_slow(vm, dict, key, slot, out);
+}
+
 static inline bool dict_get_cached(VM *vm, ObjDict *dict, ObjString *key, Value *out) {
     uint32_t slot = (((uint32_t)(uintptr_t)dict >> 4) ^ key->hash) & (DICT_IC_SIZE - 1);
     return dict_get_cached_at(vm, dict, key, slot, out);
 }
 
-static void coroutine_ensure_stack(ObjCoroutine *co, int needed) {
+typedef enum {
+    LOCAL_FIELD_UPDATE_OK,
+    LOCAL_FIELD_UPDATE_PROPAGATE,
+    LOCAL_FIELD_UPDATE_RUNTIME_ERROR
+} LocalFieldUpdateResult;
+
+static MG_NOINLINE LocalFieldUpdateResult local_field_prop_update_slow(
+    VM *vm, Value obj, ObjString *name, Value lhs,
+    bool subtract, bool allow_concat, Value *result, Value *error) {
+    Value rhs = NULL_VAL;
+    const char *kind = "LookupError";
+    const char *message = "Field not found";
+    const char *hint = NULL;
+    char message_buf[256];
+
+    if (IS_DICT(obj)) {
+        if (!dict_get_mono_cached(AS_DICT(obj), name, &rhs)) {
+            kind = "KeyError";
+            snprintf(message_buf, sizeof(message_buf), "Key not found: %.*s",
+                     name->length, name->chars);
+            message = message_buf;
+            hint = "Check dict.has(dict, key) or provide a default value.";
+            goto propagate;
+        }
+    } else if (IS_INSTANCE(obj)) {
+        ObjInstance *instance = AS_INSTANCE(obj);
+        ObjStruct *klass = instance->klass;
+        uint32_t cache_slot =
+            (((uint32_t)(uintptr_t)klass) ^
+             ((uint32_t)(uintptr_t)name >> 4)) &
+            (FIELD_IC_SIZE - 1);
+        FieldICEntry *ic = &vm->field_ic[cache_slot];
+        if (ic->klass == klass && ic->name == name) {
+            rhs = instance->fields[ic->index];
+        } else {
+            Value index_value;
+            if (!table_get(&klass->field_index, name, &index_value)) {
+                kind = "FieldError";
+                snprintf(message_buf, sizeof(message_buf),
+                         "Field not found: %.*s",
+                         name->length, name->chars);
+                message = message_buf;
+                hint = "Check the struct field name.";
+                goto propagate;
+            }
+            int index = (int)AS_NUMBER(index_value);
+            ic->klass = klass;
+            ic->name = name;
+            ic->index = index;
+            rhs = instance->fields[index];
+        }
+    } else {
+        kind = "TypeError";
+        message = "Value has no fields";
+        hint = "Use field access on structs, dicts, or error values.";
+        goto propagate;
+    }
+
+    if (IS_NUMERIC(lhs) && IS_NUMERIC(rhs)) {
+        double left = AS_NUMBER(lhs);
+        double right = AS_NUMBER(rhs);
+        *result = NUMBER_VAL(subtract ? left - right : left + right);
+        return LOCAL_FIELD_UPDATE_OK;
+    }
+    if (allow_concat && IS_OBJ(lhs) && IS_OBJ(rhs) &&
+        AS_OBJ(lhs)->type == OBJ_STRING &&
+        AS_OBJ(rhs)->type == OBJ_STRING) {
+        ObjString *joined =
+            concat_strings(vm, AS_STRING(lhs), AS_STRING(rhs));
+        if (!joined) return LOCAL_FIELD_UPDATE_RUNTIME_ERROR;
+        *result = OBJ_VAL(joined);
+        return LOCAL_FIELD_UPDATE_OK;
+    }
+
+    vm_runtime_error(vm, "Operands must be numbers.");
+    return LOCAL_FIELD_UPDATE_RUNTIME_ERROR;
+
+propagate:
+    *result = NULL_VAL;
+    *error = make_error_value(vm, kind, message, hint);
+    return LOCAL_FIELD_UPDATE_PROPAGATE;
+}
+
+static void coroutine_ensure_stack(VM *vm, ObjCoroutine *co, int needed) {
     if (co->stack_capacity >= needed) return;
     while (co->stack_capacity < needed) {
         int old_capacity = co->stack_capacity;
@@ -2549,6 +2975,7 @@ static void coroutine_ensure_stack(ObjCoroutine *co, int needed) {
             }
         }
         co->stack = new_stack;
+        vm->bytes_allocated += sizeof(Value) * (size_t)(co->stack_capacity - old_capacity);
         for (int i = old_capacity; i < co->stack_capacity; i++) {
             co->stack[i] = NULL_VAL;
         }
@@ -2641,12 +3068,18 @@ static void save_coroutine_context(VM *vm, ObjCoroutine *co) {
         memcpy(co->yield_values, vm->yield_values,
                sizeof(Value) * (size_t)co->yield_count);
     }
+    if (((Obj *)co)->is_old) {
+        /* A suspended coroutine owns its saved stack, open upvalues, defers,
+           and yielded values. Treat the whole snapshot as an old-to-young
+           mutation so the next minor collection scans it. */
+        remembered_set_add(vm, (Obj *)co);
+    }
 }
 
-static void start_coroutine_context(ObjCoroutine *co) {
+static void start_coroutine_context(VM *vm, ObjCoroutine *co) {
     ObjFunction *function = co->closure->function;
     int reg_need = function->reg_count > 0 ? function->reg_count : MAX_REGISTERS;
-    coroutine_ensure_stack(co, reg_need);
+    coroutine_ensure_stack(vm, co, reg_need);
     for (int i = 0; i < reg_need; i++) co->stack[i] = NULL_VAL;
     co->stack[0] = OBJ_VAL(co->closure);
     co->stack_size = reg_need;
@@ -2658,6 +3091,7 @@ static void start_coroutine_context(ObjCoroutine *co) {
     co->frames[0].slots = co->stack;
     co->frames[0].call_dest = 0;
     co->frames[0].expected_returns = 1;
+    co->frames[0].caller_stack_top = 0;
 }
 
 static const char *coroutine_state_name(CoroutineState state) {
@@ -2718,7 +3152,7 @@ static Value native_coroutine_resume(VM *vm, int arg_count, Value *args) {
     }
 
     if (co->state == COROUTINE_NEW) {
-        start_coroutine_context(co);
+        start_coroutine_context(vm, co);
     }
 
     SavedVMContext caller;
@@ -2727,11 +3161,23 @@ static Value native_coroutine_resume(VM *vm, int arg_count, Value *args) {
 
     co->state = COROUTINE_RUNNING;
     load_coroutine_context(vm, co);
+    bool previous_suppress_error_output = vm->suppress_error_output;
+    vm->suppress_error_output = true;
     InterpretResult result = vm_execute(vm);
+    vm->suppress_error_output = previous_suppress_error_output;
+    char coroutine_error[sizeof(vm->last_error_message)];
+    coroutine_error[0] = '\0';
+    if (result == INTERPRET_RUNTIME_ERROR) {
+        snprintf(coroutine_error, sizeof(coroutine_error), "%s",
+                 vm->last_error_message);
+    }
     int produced_count = vm->yield_count;
     Value produced[256];
     if (produced_count > 0) {
         memcpy(produced, vm->yield_values, sizeof(Value) * (size_t)produced_count);
+    }
+    if (result != INTERPRET_YIELD) {
+        close_upvalues(vm, vm->stack);
     }
     save_coroutine_context(vm, co);
 
@@ -2756,36 +3202,69 @@ static Value native_coroutine_resume(VM *vm, int arg_count, Value *args) {
         memcpy(vm->native_return_values, produced, sizeof(Value) * (size_t)produced_count);
         return produced[0];
     }
-    return make_error_value(vm, "RuntimeError", "Coroutine failed while running",
+    vm_clear_error(vm);
+    return make_error_value(vm, "RuntimeError",
+                            coroutine_error[0] ? coroutine_error :
+                            "Coroutine failed while running",
                             "Run the coroutine body directly for the runtime diagnostic.");
 }
 
 static inline double number_mod(double a, double b) {
-    if (__builtin_expect(b != 0.0, 1)) {
-        long long ia = (long long)a;
-        long long ib = (long long)b;
-        if ((double)ia == a && (double)ib == b && ib != 0) {
-            return (double)(ia % ib);
-        }
-    }
     return fmod(a, b);
 }
 
 static inline double number_mod_i(double a, int b) {
-    if (__builtin_expect(b != 0, 1)) {
-        long long ia = (long long)a;
-        if ((double)ia == a) {
-            return (double)(ia % b);
-        }
-    }
     return fmod(a, (double)b);
 }
 
-static inline __attribute__((always_inline)) Value int_or_number(long long value) {
+static inline Value int_or_number(long long value) {
     if (__builtin_expect(value >= INT32_MIN && value <= INT32_MAX, 1)) {
         return INT_VAL((int32_t)value);
     }
     return NUMBER_VAL((double)value);
+}
+
+static MG_ALWAYS_INLINE bool numeric_multiply_values(Value left, Value right,
+                                                      Value *result) {
+    if (__builtin_expect(IS_NUMBER(left) && IS_NUMBER(right), 1)) {
+        *result = NUMBER_VAL(AS_DOUBLE(left) * AS_DOUBLE(right));
+        return true;
+    }
+    if (IS_INT(left) && IS_INT(right)) {
+        *result = int_or_number((long long)AS_INT(left) *
+                                (long long)AS_INT(right));
+        return true;
+    }
+    if (IS_NUMERIC(left) && IS_NUMERIC(right)) {
+        *result = NUMBER_VAL(AS_NUMBER(left) * AS_NUMBER(right));
+        return true;
+    }
+    return false;
+}
+
+static MG_ALWAYS_INLINE bool numeric_sum_greater(Value left, Value right,
+                                                  int immediate,
+                                                  bool inclusive,
+                                                  bool *result) {
+    if (__builtin_expect(IS_NUMBER(left) && IS_NUMBER(right), 1)) {
+        double sum = AS_DOUBLE(left) + AS_DOUBLE(right);
+        *result = inclusive ? sum >= (double)immediate
+                            : sum > (double)immediate;
+        return true;
+    }
+    if (IS_INT(left) && IS_INT(right)) {
+        long long sum = (long long)AS_INT(left) + (long long)AS_INT(right);
+        *result = inclusive ? sum >= (long long)immediate
+                            : sum > (long long)immediate;
+        return true;
+    }
+    if (IS_NUMERIC(left) && IS_NUMERIC(right)) {
+        double sum = AS_NUMBER(left) + AS_NUMBER(right);
+        *result = inclusive ? sum >= (double)immediate
+                            : sum > (double)immediate;
+        return true;
+    }
+    return false;
 }
 
 /* Capture an upvalue with direct-mapped cache */
@@ -2813,7 +3292,13 @@ static ObjUpvalue *capture_upvalue(VM *vm, Value *local) {
         if (slot_idx >= 0) {
             if (slot_idx >= vm->upvalue_cache_capacity) {
                 int new_cap = slot_idx + 64;
-                vm->upvalue_cache = realloc(vm->upvalue_cache, sizeof(ObjUpvalue *) * new_cap);
+                ObjUpvalue **new_cache = realloc(
+                    vm->upvalue_cache, sizeof(ObjUpvalue *) * (size_t)new_cap);
+                if (!new_cache) {
+                    fprintf(stderr, "Out of memory growing upvalue cache.\n");
+                    exit(1);
+                }
+                vm->upvalue_cache = new_cache;
                 memset(vm->upvalue_cache + vm->upvalue_cache_capacity, 0,
                        sizeof(ObjUpvalue *) * (new_cap - vm->upvalue_cache_capacity));
                 vm->upvalue_cache_capacity = new_cap;
@@ -2835,7 +3320,13 @@ static ObjUpvalue *capture_upvalue(VM *vm, Value *local) {
     if (slot_idx >= 0) {
         if (slot_idx >= vm->upvalue_cache_capacity) {
             int new_cap = slot_idx + 64;
-            vm->upvalue_cache = realloc(vm->upvalue_cache, sizeof(ObjUpvalue *) * new_cap);
+            ObjUpvalue **new_cache = realloc(
+                vm->upvalue_cache, sizeof(ObjUpvalue *) * (size_t)new_cap);
+            if (!new_cache) {
+                fprintf(stderr, "Out of memory growing upvalue cache.\n");
+                exit(1);
+            }
+            vm->upvalue_cache = new_cache;
             memset(vm->upvalue_cache + vm->upvalue_cache_capacity, 0,
                    sizeof(ObjUpvalue *) * (new_cap - vm->upvalue_cache_capacity));
             vm->upvalue_cache_capacity = new_cap;
@@ -2872,7 +3363,7 @@ static InterpretResult vm_execute(VM *vm) {
     const Value * restrict k = frame->closure->function->chunk.constants;
     uint32_t cancel_counter = vm->loop_cancel_counter;
 
-#ifdef __GNUC__
+#if defined(__GNUC__) || defined(__clang__)
     static void *dispatch_table[] = {
         &&LBL_LOADK, &&LBL_LOADBOOL, &&LBL_LOADNIL, &&LBL_MOVE,
         &&LBL_GETGLOBAL, &&LBL_SETGLOBAL, &&LBL_GETUPVAL, &&LBL_SETUPVAL,
@@ -2912,9 +3403,14 @@ static InterpretResult vm_execute(VM *vm) {
         &&LBL_MCALLFIELD, &&LBL_MCALLFIELD0,
         &&LBL_ADDI_LOOP
     };
+    _Static_assert(sizeof(dispatch_table) / sizeof(dispatch_table[0]) == OP_COUNT,
+                   "dispatch table must match OpCode");
 
     #define READ_INST() (*ip++)
-    #define DISPATCH()  goto *dispatch_table[GET_OPCODE(*ip)]
+    #define DISPATCH()  do { \
+        if (GET_OPCODE(*ip) >= OP_COUNT) goto LBL_INVALID_OPCODE; \
+        goto *dispatch_table[GET_OPCODE(*ip)]; \
+    } while (0)
     #define NEXT()      do { ip++; DISPATCH(); } while(0)
     #define R(i)        slots[i]
     #define K(i)        k[i]
@@ -2928,6 +3424,9 @@ static InterpretResult vm_execute(VM *vm) {
             (vm->deadline_ms != 0 && monotonic_ms() >= vm->deadline_ms), 0)) { \
             MG_ATOMIC_STORE_BOOL(vm->cancel_requested, true); \
             SAVE_FRAME(); \
+            vm_runtime_error(vm, vm->deadline_ms != 0 && \
+                              monotonic_ms() >= vm->deadline_ms ? \
+                              "Execution timed out." : "Execution cancelled."); \
             return INTERPRET_RUNTIME_ERROR; \
         } \
     } while(0)
@@ -2949,6 +3448,9 @@ static InterpretResult vm_execute(VM *vm) {
             (vm->deadline_ms != 0 && monotonic_ms() >= vm->deadline_ms)) { \
             MG_ATOMIC_STORE_BOOL(vm->cancel_requested, true); \
             SAVE_FRAME(); \
+            vm_runtime_error(vm, vm->deadline_ms != 0 && \
+                              monotonic_ms() >= vm->deadline_ms ? \
+                              "Execution timed out." : "Execution cancelled."); \
             return INTERPRET_RUNTIME_ERROR; \
         } \
     } while(0)
@@ -2966,9 +3468,172 @@ static InterpretResult vm_execute(VM *vm) {
         cancel_counter--; \
     } while(0)
 
+    #define DISPATCH_OR_RUN_LOOP() do {                                  \
+        Instruction _next_inst = *ip;                                    \
+        if (GET_OPCODE(_next_inst) == OP_LOOP) {                          \
+            CHECK_LOOP_CANCEL();                                         \
+            ip++;                                                        \
+            ip -= GET_sBx(_next_inst);                                   \
+            switch (GET_OPCODE(*ip)) {                                   \
+                case OP_EQI_TEST: goto LBL_EQI_TEST;                     \
+                case OP_NEQI_TEST: goto LBL_NEQI_TEST;                   \
+                case OP_LTI_TEST: goto LBL_LTI_TEST;                     \
+                case OP_LEI_TEST: goto LBL_LEI_TEST;                     \
+                case OP_GTI_TEST: goto LBL_GTI_TEST;                     \
+                case OP_GEI_TEST: goto LBL_GEI_TEST;                     \
+                case OP_MODI_EQI_TEST: goto LBL_MODI_EQI_TEST;           \
+                case OP_MODI_NEQI_TEST: goto LBL_MODI_NEQI_TEST;         \
+                default: break;                                          \
+            }                                                            \
+        } else if (GET_OPCODE(_next_inst) == OP_JMP &&                   \
+                   GET_sBx(_next_inst) < 0) {                             \
+            CHECK_LOOP_CANCEL();                                         \
+            ip++;                                                        \
+            ip += GET_sBx(_next_inst);                                   \
+            switch (GET_OPCODE(*ip)) {                                   \
+                case OP_FORLOOP: goto LBL_FORLOOP;                       \
+                case OP_FORLOOP_INC: goto LBL_FORLOOP_INC;               \
+                case OP_FORLOOP_NUM: goto LBL_FORLOOP_NUM;               \
+                case OP_FORLOOP_INC_NUM: goto LBL_FORLOOP_INC_NUM;       \
+                case OP_EQI_TEST: goto LBL_EQI_TEST;                     \
+                case OP_NEQI_TEST: goto LBL_NEQI_TEST;                   \
+                case OP_LTI_TEST: goto LBL_LTI_TEST;                     \
+                case OP_LEI_TEST: goto LBL_LEI_TEST;                     \
+                case OP_GTI_TEST: goto LBL_GTI_TEST;                     \
+                case OP_GEI_TEST: goto LBL_GEI_TEST;                     \
+                case OP_MODI_EQI_TEST: goto LBL_MODI_EQI_TEST;           \
+                case OP_MODI_NEQI_TEST: goto LBL_MODI_NEQI_TEST;         \
+                default: break;                                          \
+            }                                                            \
+        }                                                                \
+        DISPATCH();                                                      \
+    } while (0)
+
+    #define DISPATCH_RANGE_BODY_OR_NORMAL() do {                         \
+        switch (GET_OPCODE(*ip)) {                                       \
+            case OP_EQI_TEST: goto LBL_EQI_TEST;                         \
+            case OP_NEQI_TEST: goto LBL_NEQI_TEST;                       \
+            case OP_LTI_TEST: goto LBL_LTI_TEST;                         \
+            case OP_LEI_TEST: goto LBL_LEI_TEST;                         \
+            case OP_GTI_TEST: goto LBL_GTI_TEST;                         \
+            case OP_GEI_TEST: goto LBL_GEI_TEST;                         \
+            case OP_MODI_EQI_TEST: goto LBL_MODI_EQI_TEST;               \
+            case OP_MODI_NEQI_TEST: goto LBL_MODI_NEQI_TEST;             \
+            default: DISPATCH();                                         \
+        }                                                                \
+    } while (0)
+
+    #define DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP(expected_opcode, repeat_label) do { \
+        Instruction _next_inst = *ip;                                    \
+        if (GET_OPCODE(_next_inst) == OP_LOOP) {                          \
+            CHECK_LOOP_CANCEL();                                         \
+            ip++;                                                        \
+            ip -= GET_sBx(_next_inst);                                   \
+            OpCode _target_opcode = (OpCode)GET_OPCODE(*ip);             \
+            if (_target_opcode == OP_FORLOOP_NUM) {                      \
+                Instruction _for_inst = READ_INST();                     \
+                int _a = GET_AsBx_A(_for_inst);                          \
+                double _value = AS_DOUBLE(R(_a)) + 1.0;                  \
+                R(_a) = NUMBER_VAL(_value);                              \
+                if (_value >= AS_DOUBLE(R(_a + 1))) {                    \
+                    ip += GET_AsBx_sBx(_for_inst);                       \
+                    DISPATCH();                                          \
+                }                                                        \
+                if (GET_OPCODE(*ip) == (expected_opcode)) {              \
+                    goto repeat_label;                                   \
+                }                                                        \
+                DISPATCH();                                              \
+            }                                                            \
+            if (_target_opcode == OP_FORLOOP_INC_NUM) {                  \
+                Instruction _for_inst = READ_INST();                     \
+                int _a = GET_AsBx_A(_for_inst);                          \
+                double _value = AS_DOUBLE(R(_a)) + 1.0;                  \
+                R(_a) = NUMBER_VAL(_value);                              \
+                if (_value > AS_DOUBLE(R(_a + 1))) {                     \
+                    ip += GET_AsBx_sBx(_for_inst);                       \
+                    DISPATCH();                                          \
+                }                                                        \
+                if (GET_OPCODE(*ip) == (expected_opcode)) {              \
+                    goto repeat_label;                                   \
+                }                                                        \
+                DISPATCH();                                              \
+            }                                                            \
+        }                                                                \
+        DISPATCH();                                                      \
+    } while (0)
+
+    #define DISPATCH_OR_RUN_ADJACENT_ARITHMETIC() do {                    \
+        Instruction *_code_end = frame->closure->function->chunk.code +  \
+                                 frame->closure->function->chunk.count;    \
+        switch (GET_OPCODE(ip[0])) {                                      \
+            case OP_ADDI: goto LBL_ADDI;                                  \
+            case OP_SUBI: goto LBL_SUBI;                                  \
+            case OP_MULI: goto LBL_MULI;                                  \
+            case OP_DIVI: goto LBL_DIVI;                                  \
+            case OP_MODI: goto LBL_MODI;                                  \
+            default: break;                                               \
+        }                                                                 \
+        if (_code_end - ip >= 2 && GET_OPCODE(ip[1]) == OP_AUX) {         \
+            switch (GET_OPCODE(ip[0])) {                                  \
+                case OP_ADDSUB: goto LBL_ADDSUB;                          \
+                case OP_SUBADD: goto LBL_SUBADD;                          \
+                case OP_MULADD: goto LBL_MULADD;                          \
+                case OP_MULSUB: goto LBL_MULSUB;                          \
+                default: break;                                           \
+            }                                                             \
+        }                                                                 \
+        DISPATCH();                                                       \
+    } while (0)
+
+    #define TRY_FUSE_NUMERIC_FIELD_ADD(instance, field_index, get_inst) do {       \
+        Instruction *_code_end = frame->closure->function->chunk.code +           \
+                                 frame->closure->function->chunk.count;             \
+        if (__builtin_expect(_code_end - ip >= 2, 1)) {                            \
+            Instruction _add_inst = ip[0];                                         \
+            Instruction _set_inst = ip[1];                                         \
+            int _get_dest = (int)GET_A(get_inst);                                  \
+            int _object_reg = (int)GET_B(get_inst);                                \
+            int _add_dest = (int)GET_A(_add_inst);                                 \
+            if (GET_OPCODE(_add_inst) == OP_ADD &&                                 \
+                GET_OPCODE(_set_inst) == OP_SETFIELD &&                            \
+                ((int)GET_B(_add_inst) == _get_dest ||                             \
+                 (int)GET_C(_add_inst) == _get_dest) &&                            \
+                (int)GET_A(_set_inst) == _object_reg &&                            \
+                GET_B(_set_inst) == GET_C(get_inst) &&                             \
+                (int)GET_C(_set_inst) == _add_dest &&                              \
+                _get_dest != _object_reg && _add_dest != _object_reg) {             \
+                Value _field_value = (instance)->fields[(field_index)];             \
+                R(_get_dest) = _field_value;                                       \
+                Value _left = R(GET_B(_add_inst));                                 \
+                Value _right = R(GET_C(_add_inst));                                \
+                Value _sum;                                                        \
+                bool _numeric = true;                                              \
+                if (__builtin_expect(IS_INT(_left) && IS_INT(_right), 1)) {         \
+                    _sum = int_or_number((long long)AS_INT(_left) +                 \
+                                         (long long)AS_INT(_right));                \
+                } else if (__builtin_expect(IS_NUMBER(_left) &&                    \
+                                            IS_NUMBER(_right), 1)) {               \
+                    _sum = NUMBER_VAL(AS_DOUBLE(_left) + AS_DOUBLE(_right));        \
+                } else if (IS_NUMERIC(_left) && IS_NUMERIC(_right)) {              \
+                    _sum = NUMBER_VAL(AS_NUMBER(_left) + AS_NUMBER(_right));        \
+                } else {                                                           \
+                    _numeric = false;                                              \
+                }                                                                  \
+                if (_numeric) {                                                    \
+                    R(_add_dest) = _sum;                                           \
+                    (instance)->fields[(field_index)] = _sum;                       \
+                    ip += 2;                                                       \
+                    DISPATCH();                                                    \
+                }                                                                  \
+            }                                                                      \
+        }                                                                          \
+    } while (0)
+
 #define RETURN_VALUES(first_reg, return_count) do {                                      \
     int _first = (first_reg);                                                            \
-    int _ret_count = (return_count);                                                      \
+    int _ret_count = (return_count);                                                     \
+    int _return_old_top = vm->stack_top;                                                 \
+    int _return_caller_top = frame->caller_stack_top;                                    \
     if (vm->open_upvalues) {                                                             \
         close_upvalues(vm, slots);                                                       \
     }                                                                                    \
@@ -2980,6 +3645,9 @@ static InterpretResult vm_execute(VM *vm) {
                 vm->yield_values[_i] = R(_first + _i);                                   \
             }                                                                            \
         }                                                                                \
+        clear_stack_range(vm, _return_caller_top, _return_old_top);                      \
+        vm->stack_top = _return_caller_top;                                              \
+        vm->stack_size = _return_caller_top;                                             \
         vm->loop_cancel_counter = cancel_counter;                                           \
         return INTERPRET_OK;                                                             \
     }                                                                                    \
@@ -2991,6 +3659,9 @@ static InterpretResult vm_execute(VM *vm) {
         slots = frame->slots;                                                            \
         ip = frame->ip;                                                                  \
         k = frame->closure->function->chunk.constants;                                   \
+        clear_stack_range(vm, _return_caller_top, _return_old_top);                      \
+        vm->stack_top = _return_caller_top;                                              \
+        vm->stack_size = _return_caller_top;                                             \
         if (_expected > 0) {                                                             \
             slots[_call_dest] = _result;                                                 \
             for (int _i = 1; _i < _expected; _i++) {                                     \
@@ -3007,6 +3678,9 @@ static InterpretResult vm_execute(VM *vm) {
         int _call_dest = frame->call_dest;                                               \
         int _expected = frame->expected_returns;                                         \
         LOAD_FRAME();                                                                    \
+        clear_stack_range(vm, _return_caller_top, _return_old_top);                      \
+        vm->stack_top = _return_caller_top;                                              \
+        vm->stack_size = _return_caller_top;                                             \
         int _write_count = (_ret_count < _expected) ? _ret_count : _expected;            \
         for (int _i = 0; _i < _write_count; _i++) {                                      \
             R(_call_dest + _i) = _ret_vals[_i];                                          \
@@ -3060,7 +3734,7 @@ static InterpretResult vm_execute(VM *vm) {
     STORE_SINGLE_RESULT(_native_base, _native_expected, (result_value));                 \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LOADK:
 #endif
 LBL_LOADK: {
@@ -3069,7 +3743,7 @@ LBL_LOADK: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LOADBOOL:
 #endif
 LBL_LOADBOOL: {
@@ -3079,7 +3753,7 @@ LBL_LOADBOOL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LOADNIL:
 #endif
 LBL_LOADNIL: {
@@ -3089,7 +3763,7 @@ LBL_LOADNIL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MOVE:
 #endif
 LBL_MOVE: {
@@ -3098,7 +3772,7 @@ LBL_MOVE: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETGLOBAL:
 #endif
 LBL_GETGLOBAL: {
@@ -3125,7 +3799,7 @@ LBL_GETGLOBAL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETGLOBAL:
 #endif
 LBL_SETGLOBAL: {
@@ -3140,7 +3814,7 @@ LBL_SETGLOBAL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETUPVAL:
 #endif
 LBL_GETUPVAL: {
@@ -3149,18 +3823,20 @@ LBL_GETUPVAL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETUPVAL:
 #endif
 LBL_SETUPVAL: {
     Instruction inst = READ_INST();
-    *frame->closure->upvalues[GET_B(inst)]->location = R(GET_A(inst));
+    ObjUpvalue *upvalue = frame->closure->upvalues[GET_B(inst)];
+    *upvalue->location = R(GET_A(inst));
+    gc_write_barrier(vm, (Obj *)upvalue, *upvalue->location);
     DISPATCH();
 }
 
 /* Arithmetic */
 /* Pure numeric ADD (string concat handled by OP_CONCAT) */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADD:
 #endif
 LBL_ADD: {
@@ -3176,7 +3852,10 @@ LBL_ADD: {
     } else if (IS_OBJ(vb) && IS_OBJ(vc) &&
                AS_OBJ(vb)->type == OBJ_STRING && AS_OBJ(vc)->type == OBJ_STRING) {
         SAVE_FRAME();
-        R(GET_A(inst)) = OBJ_VAL(concat_strings(vm, (ObjString*)AS_OBJ(vb), (ObjString*)AS_OBJ(vc)));
+        ObjString *joined = concat_strings(vm, (ObjString *)AS_OBJ(vb),
+                                          (ObjString *)AS_OBJ(vc));
+        if (!joined) return INTERPRET_RUNTIME_ERROR;
+        R(GET_A(inst)) = OBJ_VAL(joined);
         LOAD_FRAME();
     } else {
         SAVE_FRAME();
@@ -3228,18 +3907,75 @@ op_name: {                                                                 \
     DISPATCH();                                                            \
 }
 
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_SUB:
+#endif
 INT_BINARY_NUM_OP(LBL_SUB, -)
-INT_BINARY_NUM_OP(LBL_MUL, *)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_MUL:
+#endif
+LBL_MUL: {
+    Instruction inst = READ_INST();
+    Value left = R(GET_B(inst));
+    Value right = R(GET_C(inst));
+    Value product;
+    if (!numeric_multiply_values(left, right, &product)) {
+        SAVE_FRAME();
+        vm_runtime_error(vm,
+                         "Operator '*' expected two numbers, got %s and %s.",
+                         value_type_name(left), value_type_name(right));
+        return INTERPRET_RUNTIME_ERROR;
+    }
+    R(GET_A(inst)) = product;
+
+    Instruction *code_end = frame->closure->function->chunk.code +
+                            frame->closure->function->chunk.count;
+    if (__builtin_expect(ip < code_end && GET_OPCODE(*ip) == OP_MUL, 0)) {
+        Instruction next_mul = *ip;
+        Value next_left = R(GET_B(next_mul));
+        Value next_right = R(GET_C(next_mul));
+        Value next_product;
+        if (numeric_multiply_values(next_left, next_right, &next_product)) {
+            ip++;
+            R(GET_A(next_mul)) = next_product;
+
+            if (code_end - ip >= 3 && GET_OPCODE(ip[1]) == OP_JMP) {
+                OpCode next_opcode = (OpCode)GET_OPCODE(*ip);
+                if (next_opcode == OP_ADD_GT_TEST ||
+                    next_opcode == OP_ADD_GE_TEST) {
+                    Instruction test = *ip;
+                    bool result;
+                    if (numeric_sum_greater(R(GET_A(test)), R(GET_B(test)),
+                                            GET_sC(test),
+                                            next_opcode == OP_ADD_GE_TEST,
+                                            &result)) {
+                        ip++;
+                        if (result) {
+                            ip++;
+                        } else {
+                            Instruction jump = *ip++;
+                            ip += GET_sBx(jump);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DISPATCH();
+}
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_DIV:
+#endif
 BINARY_NUM_OP(LBL_DIV, /)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MOD:
 #endif
 LBL_MOD: {
     Instruction inst = READ_INST();
     Value vb = R(GET_B(inst)), vc = R(GET_C(inst));
     if (IS_INT(vb) && IS_INT(vc) && AS_INT(vc) != 0) {
-        R(GET_A(inst)) = INT_VAL(AS_INT(vb) % AS_INT(vc));
+        R(GET_A(inst)) = INT_VAL(int32_mod_nonzero(AS_INT(vb), AS_INT(vc)));
     } else if (IS_NUMBER(vb) && IS_NUMBER(vc)) {
         R(GET_A(inst)) = NUMBER_VAL(number_mod(AS_NUMBER(vb), AS_NUMBER(vc)));
     } else if (IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
@@ -3254,7 +3990,7 @@ LBL_MOD: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEG:
 #endif
 LBL_NEG: {
@@ -3317,11 +4053,23 @@ op_name: {                                                                 \
     DISPATCH();                                                            \
 }
 
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_ADDK:
+#endif
 FUSED_NUM_OP(LBL_ADDK, +)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_SUBK:
+#endif
 FUSED_NUM_OP(LBL_SUBK, -)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_MULK:
+#endif
 FUSED_NUM_OP(LBL_MULK, *)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_DIVK:
+#endif
 FUSED_NUM_OP_DOUBLE(LBL_DIVK, /)
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MODK:
 #endif
 LBL_MODK: {
@@ -3360,7 +4108,7 @@ op_name: {                                                                \
                          #operator, value_type_name(vb));                 \
         return INTERPRET_RUNTIME_ERROR;                                    \
     }                                                                     \
-    DISPATCH();                                                           \
+    DISPATCH_OR_RUN_LOOP();                                               \
 }
 
 #define IMMEDIATE_NUM_OP(op_name, operator)                               \
@@ -3377,14 +4125,78 @@ op_name: {                                                                \
                          #operator, value_type_name(vb));                 \
         return INTERPRET_RUNTIME_ERROR;                                    \
     }                                                                     \
-    DISPATCH();                                                           \
+    DISPATCH_OR_RUN_LOOP();                                               \
 }
 
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_ADDI:
+#endif
 INT_IMMEDIATE_NUM_OP(LBL_ADDI, +)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_SUBI:
+#endif
 INT_IMMEDIATE_NUM_OP(LBL_SUBI, -)
-INT_IMMEDIATE_NUM_OP(LBL_MULI, *)
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_MULI:
+#endif
+LBL_MULI: {
+    Instruction inst = READ_INST();
+    int dest = (int)GET_A(inst);
+    Value value = R(GET_B(inst));
+    int immediate = GET_sC(inst);
+    if (__builtin_expect(IS_NUMBER(value), 1)) {
+        R(dest) = NUMBER_VAL(AS_DOUBLE(value) * (double)immediate);
+    } else if (IS_INT(value)) {
+        R(dest) = int_or_number((long long)AS_INT(value) *
+                                (long long)immediate);
+    } else if (IS_NUMERIC(value)) {
+        R(dest) = NUMBER_VAL(AS_NUMBER(value) * (double)immediate);
+    } else {
+        SAVE_FRAME();
+        vm_runtime_error(vm, "Operator '*' expected a number, got %s.",
+                         value_type_name(value));
+        return INTERPRET_RUNTIME_ERROR;
+    }
+
+    Instruction *code_end = frame->closure->function->chunk.code +
+                            frame->closure->function->chunk.count;
+    if (__builtin_expect(code_end - ip >= 2 &&
+                         GET_OPCODE(ip[0]) == OP_MULADD &&
+                         GET_OPCODE(ip[1]) == OP_AUX &&
+                         ((int)GET_B(ip[0]) == dest ||
+                          (int)GET_C(ip[0]) == dest ||
+                          (int)GET_Bx(ip[1]) == dest), 0)) {
+        Instruction muladd = ip[0];
+        Instruction aux = ip[1];
+        Value left = R(GET_B(muladd));
+        Value right = R(GET_C(muladd));
+        Value addend = R(GET_Bx(aux));
+        int result_reg = (int)GET_A(muladd);
+        if (__builtin_expect(IS_NUMBER(left) && IS_NUMBER(right) &&
+                             IS_NUMBER(addend), 1)) {
+            R(result_reg) = NUMBER_VAL(AS_DOUBLE(left) * AS_DOUBLE(right) +
+                                       AS_DOUBLE(addend));
+        } else if (IS_INT(left) && IS_INT(right) && IS_INT(addend)) {
+            R(result_reg) = int_or_number(
+                (long long)AS_INT(left) * (long long)AS_INT(right) +
+                (long long)AS_INT(addend));
+        } else if (IS_NUMERIC(left) && IS_NUMERIC(right) &&
+                   IS_NUMERIC(addend)) {
+            R(result_reg) = NUMBER_VAL(AS_NUMBER(left) * AS_NUMBER(right) +
+                                       AS_NUMBER(addend));
+        } else {
+            goto LBL_MULADD;
+        }
+        ip += 2;
+        DISPATCH_OR_RUN_ADJACENT_ARITHMETIC();
+    }
+    DISPATCH_OR_RUN_LOOP();
+}
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_DIVI:
+#endif
 IMMEDIATE_NUM_OP(LBL_DIVI, /)
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MODI:
 #endif
 LBL_MODI: {
@@ -3392,7 +4204,7 @@ LBL_MODI: {
     Value vb = R(GET_B(inst));
     int imm = GET_sC(inst);
     if (__builtin_expect(IS_INT(vb) && imm != 0, 1)) {
-        R(GET_A(inst)) = INT_VAL(AS_INT(vb) % imm);
+        R(GET_A(inst)) = INT_VAL(int32_mod_immediate_nonzero(AS_INT(vb), imm));
     } else if (__builtin_expect(IS_NUMBER(vb), 1)) {
         R(GET_A(inst)) = NUMBER_VAL(number_mod_i(AS_DOUBLE(vb), GET_sC(inst)));
     } else if (IS_NUMERIC(vb)) {
@@ -3406,8 +4218,30 @@ LBL_MODI: {
     DISPATCH();
 }
 
-/* Comparison */
-#ifndef __GNUC__
+/* Comparison
+ *
+ * A comparison used as a condition is encoded as two ordinary instructions:
+ * the comparison writes a boolean and TESTJMP immediately consumes it. Keep
+ * the bytecode format and visible result unchanged, but avoid a second
+ * dispatch when the test reads the comparison's destination register. */
+#define STORE_COMPARISON_RESULT(inst, result) do {                         \
+    bool _comparison_result = (result);                                   \
+    int _comparison_register = GET_A(inst);                               \
+    R(_comparison_register) = BOOL_VAL(_comparison_result);               \
+    Instruction _next_inst = *ip;                                         \
+    if (__builtin_expect(GET_OPCODE(_next_inst) == OP_TESTJMP &&          \
+                         (int)GET_AsBx_A(_next_inst) ==                    \
+                             _comparison_register,                        \
+                         1)) {                                            \
+        ip++;                                                             \
+        if (!_comparison_result) {                                        \
+            ip += GET_AsBx_sBx(_next_inst);                               \
+        }                                                                 \
+    }                                                                     \
+    DISPATCH();                                                           \
+} while (0)
+
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_EQ:
 #endif
 LBL_EQ: {
@@ -3417,11 +4251,10 @@ LBL_EQ: {
     bool equal = vb == vc ||
         (((IS_NUMERIC(vb) && IS_NUMERIC(vc)) || (IS_STRING(vb) && IS_STRING(vc))) &&
          values_equal(vb, vc));
-    R(GET_A(inst)) = BOOL_VAL(equal);
-    DISPATCH();
+    STORE_COMPARISON_RESULT(inst, equal);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEQ:
 #endif
 LBL_NEQ: {
@@ -3431,21 +4264,21 @@ LBL_NEQ: {
     bool equal = vb == vc ||
         (((IS_NUMERIC(vb) && IS_NUMERIC(vc)) || (IS_STRING(vb) && IS_STRING(vc))) &&
          values_equal(vb, vc));
-    R(GET_A(inst)) = BOOL_VAL(!equal);
-    DISPATCH();
+    STORE_COMPARISON_RESULT(inst, !equal);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LT:
 #endif
 LBL_LT: {
     Instruction inst = READ_INST();
     Value vb = R(GET_B(inst));
     Value vc = R(GET_C(inst));
+    bool less;
     if (__builtin_expect(IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
-        R(GET_A(inst)) = BOOL_VAL(AS_DOUBLE(vb) < AS_DOUBLE(vc));
+        less = AS_DOUBLE(vb) < AS_DOUBLE(vc);
     } else if (IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
-        R(GET_A(inst)) = BOOL_VAL(AS_NUMBER(vb) < AS_NUMBER(vc));
+        less = AS_NUMBER(vb) < AS_NUMBER(vc);
     } else {
         SAVE_FRAME();
         vm_runtime_error(vm,
@@ -3453,20 +4286,21 @@ LBL_LT: {
                          value_type_name(vb), value_type_name(vc));
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    STORE_COMPARISON_RESULT(inst, less);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LE:
 #endif
 LBL_LE: {
     Instruction inst = READ_INST();
     Value vb = R(GET_B(inst));
     Value vc = R(GET_C(inst));
+    bool less_equal;
     if (__builtin_expect(IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
-        R(GET_A(inst)) = BOOL_VAL(AS_DOUBLE(vb) <= AS_DOUBLE(vc));
+        less_equal = AS_DOUBLE(vb) <= AS_DOUBLE(vc);
     } else if (IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
-        R(GET_A(inst)) = BOOL_VAL(AS_NUMBER(vb) <= AS_NUMBER(vc));
+        less_equal = AS_NUMBER(vb) <= AS_NUMBER(vc);
     } else {
         SAVE_FRAME();
         vm_runtime_error(vm,
@@ -3474,10 +4308,10 @@ LBL_LE: {
                          value_type_name(vb), value_type_name(vc));
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    STORE_COMPARISON_RESULT(inst, less_equal);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_EQI:
 #endif
 LBL_EQI: {
@@ -3488,7 +4322,7 @@ LBL_EQI: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEQI:
 #endif
 LBL_NEQI: {
@@ -3499,7 +4333,7 @@ LBL_NEQI: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LTI:
 #endif
 LBL_LTI: {
@@ -3518,7 +4352,7 @@ LBL_LTI: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LEI:
 #endif
 LBL_LEI: {
@@ -3537,7 +4371,7 @@ LBL_LEI: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GTI:
 #endif
 LBL_GTI: {
@@ -3556,7 +4390,7 @@ LBL_GTI: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GEI:
 #endif
 LBL_GEI: {
@@ -3585,7 +4419,7 @@ LBL_GEI: {
     DISPATCH();                                                           \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_EQI_TEST:
 #endif
 LBL_EQI_TEST: {
@@ -3595,7 +4429,7 @@ LBL_EQI_TEST: {
         (IS_NUMBER(value) && AS_DOUBLE(value) == (double)GET_sB(inst)));
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEQI_TEST:
 #endif
 LBL_NEQI_TEST: {
@@ -3605,7 +4439,7 @@ LBL_NEQI_TEST: {
         (!IS_NUMBER(value) || AS_DOUBLE(value) != (double)GET_sB(inst)));
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LTI_TEST:
 #endif
 LBL_LTI_TEST: {
@@ -3623,7 +4457,7 @@ LBL_LTI_TEST: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LEI_TEST:
 #endif
 LBL_LEI_TEST: {
@@ -3641,7 +4475,7 @@ LBL_LEI_TEST: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GTI_TEST:
 #endif
 LBL_GTI_TEST: {
@@ -3659,7 +4493,7 @@ LBL_GTI_TEST: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GEI_TEST:
 #endif
 LBL_GEI_TEST: {
@@ -3677,7 +4511,7 @@ LBL_GEI_TEST: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MODI_EQI_TEST:
 #endif
 LBL_MODI_EQI_TEST: {
@@ -3685,7 +4519,8 @@ LBL_MODI_EQI_TEST: {
     Value value = R(GET_A(inst));
     int divisor = GET_sB(inst);
     if (__builtin_expect(IS_INT(value) && divisor != 0, 1)) {
-        INLINE_TEST_RESULT((AS_INT(value) % divisor) == GET_sC(inst));
+        INLINE_TEST_RESULT(
+            int32_mod_immediate_nonzero(AS_INT(value), divisor) == GET_sC(inst));
     }
     if (__builtin_expect(IS_NUMBER(value), 1)) {
         double mod = number_mod_i(AS_DOUBLE(value), GET_sB(inst));
@@ -3696,7 +4531,7 @@ LBL_MODI_EQI_TEST: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MODI_NEQI_TEST:
 #endif
 LBL_MODI_NEQI_TEST: {
@@ -3704,7 +4539,8 @@ LBL_MODI_NEQI_TEST: {
     Value value = R(GET_A(inst));
     int divisor = GET_sB(inst);
     if (__builtin_expect(IS_INT(value) && divisor != 0, 1)) {
-        INLINE_TEST_RESULT((AS_INT(value) % divisor) != GET_sC(inst));
+        INLINE_TEST_RESULT(
+            int32_mod_immediate_nonzero(AS_INT(value), divisor) != GET_sC(inst));
     }
     if (__builtin_expect(IS_NUMBER(value), 1)) {
         double mod = number_mod_i(AS_DOUBLE(value), GET_sB(inst));
@@ -3716,7 +4552,7 @@ LBL_MODI_NEQI_TEST: {
 }
 
 /* --- Logical --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NOT:
 #endif
 LBL_NOT: {
@@ -3725,7 +4561,7 @@ LBL_NOT: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_TEST:
 #endif
 LBL_TEST: {
@@ -3741,7 +4577,7 @@ LBL_TEST: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_TESTSET:
 #endif
 LBL_TESTSET: {
@@ -3759,7 +4595,7 @@ LBL_TESTSET: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_TESTJMP:
 #endif
 LBL_TESTJMP: {
@@ -3770,7 +4606,7 @@ LBL_TESTJMP: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_TESTERRJMP:
 #endif
 LBL_TESTERRJMP: {
@@ -3781,7 +4617,7 @@ LBL_TESTERRJMP: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CONCAT:
 #endif
 LBL_CONCAT: {
@@ -3797,10 +4633,18 @@ LBL_CONCAT: {
             vm_runtime_error(vm, "Can only concatenate strings.");
             return INTERPRET_RUNTIME_ERROR;
         }
+        if (AS_STRING(R(i))->length > INT_MAX - total_len) {
+            vm_runtime_error(vm, "Concatenated string is too large.");
+            return INTERPRET_RUNTIME_ERROR;
+        }
         total_len += AS_STRING(R(i))->length;
     }
     /* Second pass: allocate once and copy all segments */
-    char *buf = (char *)malloc(total_len + 1);
+    char *buf = (char *)malloc((size_t)total_len + 1);
+    if (!buf) {
+        vm_runtime_error(vm, "Out of memory concatenating strings.");
+        return INTERPRET_RUNTIME_ERROR;
+    }
     int pos = 0;
     for (int i = b; i <= c; i++) {
         ObjString *s = AS_STRING(R(i));
@@ -3813,7 +4657,7 @@ LBL_CONCAT: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_TOSTRING:
 #endif
 LBL_TOSTRING: {
@@ -3825,7 +4669,9 @@ LBL_TOSTRING: {
     }
     if (IS_INT(val)) {
         int32_t num = AS_INT(val);
-        if ((uint32_t)num < INT_STR_CACHE_SIZE && vm->int_str_cache[num] != NULL) {
+        if ((uint32_t)num < INT_STR_CACHE_SIZE &&
+            vm->int_str_cache != NULL &&
+            vm->int_str_cache[num] != NULL) {
             R(GET_A(inst)) = OBJ_VAL(vm->int_str_cache[num]);
             DISPATCH();
         }
@@ -3836,7 +4682,7 @@ LBL_TOSTRING: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LEN:
 #endif
 LBL_LEN: {
@@ -3855,17 +4701,20 @@ LBL_LEN: {
 }
 
 /* --- Jumps --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_JMP:
 #endif
 LBL_JMP: {
     Instruction inst = READ_INST();
     int offset = GET_sBx(inst);
+    if (__builtin_expect(offset < 0, 0)) {
+        CHECK_LOOP_CANCEL();
+    }
     ip += offset;
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_LOOP:
 #endif
 LBL_LOOP: {
@@ -3876,6 +4725,9 @@ LBL_LOOP: {
     DISPATCH();
 }
 
+#if !defined(__GNUC__) && !defined(__clang__)
+    case OP_ADDI_LOOP:
+#endif
 LBL_ADDI_LOOP: {
     CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
@@ -3899,10 +4751,11 @@ LBL_ADDI_LOOP: {
     return INTERPRET_RUNTIME_ERROR;
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORPREP:
 #endif
 LBL_FORPREP: {
+    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_A(inst);
     Value iter = R(a);
@@ -3938,10 +4791,11 @@ LBL_FORPREP: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORPREP_NUM:
 #endif
 LBL_FORPREP_NUM: {
+    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_A(inst);
     Value iter = R(a);
@@ -3957,11 +4811,10 @@ LBL_FORPREP_NUM: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORLOOP:
 #endif
 LBL_FORLOOP: {
-    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_AsBx_A(inst);
     int offset = GET_AsBx_sBx(inst);
@@ -3972,22 +4825,23 @@ LBL_FORLOOP: {
         R(a) = INT_VAL(next);
         if (next >= AS_INT(limit_val)) {
             ip += offset;
+            DISPATCH();
         }
-        DISPATCH();
+        DISPATCH_RANGE_BODY_OR_NORMAL();
     }
     double val = AS_DOUBLE(iter_val) + 1.0;
     R(a) = NUMBER_VAL(val);
     if (val >= AS_DOUBLE(limit_val)) {
         ip += offset;
+        DISPATCH();
     }
-    DISPATCH();
+    DISPATCH_RANGE_BODY_OR_NORMAL();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORLOOP_INC:
 #endif
 LBL_FORLOOP_INC: {
-    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_AsBx_A(inst);
     int offset = GET_AsBx_sBx(inst);
@@ -3998,22 +4852,23 @@ LBL_FORLOOP_INC: {
         R(a) = INT_VAL(next);
         if (next > AS_INT(limit_val)) {
             ip += offset;
+            DISPATCH();
         }
-        DISPATCH();
+        DISPATCH_RANGE_BODY_OR_NORMAL();
     }
     double val = AS_DOUBLE(iter_val) + 1.0;
     R(a) = NUMBER_VAL(val);
     if (val > AS_DOUBLE(limit_val)) {
         ip += offset;
+        DISPATCH();
     }
-    DISPATCH();
+    DISPATCH_RANGE_BODY_OR_NORMAL();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORLOOP_NUM:
 #endif
 LBL_FORLOOP_NUM: {
-    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_AsBx_A(inst);
     int offset = GET_AsBx_sBx(inst);
@@ -4023,15 +4878,15 @@ LBL_FORLOOP_NUM: {
     R(a) = NUMBER_VAL(val);
     if (val >= AS_DOUBLE(limit_val)) {
         ip += offset;
+        DISPATCH();
     }
-    DISPATCH();
+    DISPATCH_RANGE_BODY_OR_NORMAL();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORLOOP_INC_NUM:
 #endif
 LBL_FORLOOP_INC_NUM: {
-    CHECK_LOOP_CANCEL();
     Instruction inst = READ_INST();
     int a = GET_AsBx_A(inst);
     int offset = GET_AsBx_sBx(inst);
@@ -4041,8 +4896,9 @@ LBL_FORLOOP_INC_NUM: {
     R(a) = NUMBER_VAL(val);
     if (val > AS_DOUBLE(limit_val)) {
         ip += offset;
+        DISPATCH();
     }
-    DISPATCH();
+    DISPATCH_RANGE_BODY_OR_NORMAL();
 }
 
 #define FORADD_FIELD_PROP_RUN(label, inclusive, error_label, global_target) do {    \
@@ -4077,13 +4933,11 @@ label: {                                                                        
     } else if (IS_NUMERIC(start_v) && IS_NUMERIC(limit_v)) {                        \
         double start = AS_NUMBER(start_v);                                          \
         double limit = AS_NUMBER(limit_v);                                          \
-        if (inclusive) {                                                            \
-            count = start <= limit ? (long long)floor(limit - start) + 1 : 0;       \
-        } else {                                                                    \
-            count = start < limit ? (long long)ceil(limit - start) : 0;             \
+        if (!range_iteration_count(start, limit, inclusive, &count, &final_num)) {  \
+            SAVE_FRAME();                                                           \
+            vm_runtime_error(vm, "Range is outside the supported iteration range.");\
+            return INTERPRET_RUNTIME_ERROR;                                         \
         }                                                                           \
-        if (count < 0) count = 0;                                                   \
-        final_num = start + (double)count;                                          \
     } else {                                                                        \
         SAVE_FRAME();                                                               \
         vm_runtime_error(vm, "Range bounds must be numbers.");                      \
@@ -4175,7 +5029,9 @@ label: {                                                                        
                 CHECK_CANCEL();                                                     \
             }                                                                       \
             SAVE_FRAME();                                                           \
-            R(target) = OBJ_VAL(concat_strings(vm, AS_STRING(R(target)), AS_STRING(rhs))); \
+            ObjString *joined__ = concat_strings(vm, AS_STRING(R(target)), AS_STRING(rhs)); \
+            if (!joined__) return INTERPRET_RUNTIME_ERROR;                          \
+            R(target) = OBJ_VAL(joined__);                                          \
             LOAD_FRAME();                                                           \
         }                                                                           \
         R(iter_reg) = int_bounds ? int_or_number(final_int) : NUMBER_VAL(final_num);\
@@ -4201,25 +5057,25 @@ error_label:                                                                    
 }                                                                                   \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORADDLOCAL_FIELD_PROP:
 #endif
 FORADD_FIELD_PROP_RUN(LBL_FORADDLOCAL_FIELD_PROP, false,
                       LBL_FORADDLOCAL_FIELD_PROP_ERROR, false);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORADDLOCAL_FIELD_PROP_INC:
 #endif
 FORADD_FIELD_PROP_RUN(LBL_FORADDLOCAL_FIELD_PROP_INC, true,
                       LBL_FORADDLOCAL_FIELD_PROP_INC_ERROR, false);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORADDGLOBAL_FIELD_PROP:
 #endif
 FORADD_FIELD_PROP_RUN(LBL_FORADDGLOBAL_FIELD_PROP, false,
                       LBL_FORADDGLOBAL_FIELD_PROP_ERROR, true);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FORADDGLOBAL_FIELD_PROP_INC:
 #endif
 FORADD_FIELD_PROP_RUN(LBL_FORADDGLOBAL_FIELD_PROP_INC, true,
@@ -4316,12 +5172,12 @@ label: {                                                                        
 }                                                                                  \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FOR_MODI_ACCUM:
 #endif
 FOR_MODI_ACCUM_RUN(LBL_FOR_MODI_ACCUM, false);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FOR_MODI_ACCUM_INC:
 #endif
 FOR_MODI_ACCUM_RUN(LBL_FOR_MODI_ACCUM_INC, true);
@@ -4359,13 +5215,11 @@ label: {                                                                        
     } else if (__builtin_expect(IS_NUMERIC(start_v) && IS_NUMERIC(limit_v), 1)) {  \
         double start = AS_NUMBER(start_v);                                         \
         double limit = AS_NUMBER(limit_v);                                         \
-        if (inclusive) {                                                           \
-            count = start <= limit ? (long long)floor(limit - start) + 1 : 0;      \
-        } else {                                                                   \
-            count = start < limit ? (long long)ceil(limit - start) : 0;            \
+        if (!range_iteration_count(start, limit, inclusive, &count, &final_num)) { \
+            SAVE_FRAME();                                                          \
+            vm_runtime_error(vm, "Range is outside the supported iteration range.");\
+            return INTERPRET_RUNTIME_ERROR;                                        \
         }                                                                          \
-        if (count < 0) count = 0;                                                  \
-        final_num = start + (double)count;                                         \
     } else {                                                                       \
         SAVE_FRAME();                                                              \
         vm_runtime_error(vm, "Range bounds must be numbers.");                     \
@@ -4399,10 +5253,11 @@ label: {                                                                        
         vm_runtime_error(vm, "Operands must be numbers.");                         \
         return INTERPRET_RUNTIME_ERROR;                                            \
     }                                                                              \
-    for (long long n = 0; n < count; n += 4096) {                                  \
+    for (long long remaining = count; remaining > 0; ) {                          \
         if (__builtin_expect(MG_ATOMIC_LOAD_BOOL(vm->cancel_requested) || vm->deadline_ms != 0, 0)) { \
             CHECK_CANCEL();                                                        \
         }                                                                          \
+        remaining -= remaining > 4096 ? 4096 : remaining;                         \
     }                                                                              \
     obj->fields[idx0] = NUMBER_VAL(AS_NUMBER(value0) + (double)delta0 * (double)count); \
     obj->fields[idx1] = NUMBER_VAL(AS_NUMBER(value1) + (double)delta1 * (double)count); \
@@ -4411,19 +5266,19 @@ label: {                                                                        
 }                                                                                  \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FOR_FIELD2_ACCUM:
 #endif
 FOR_FIELD2_ACCUM_RUN(LBL_FOR_FIELD2_ACCUM, false);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_FOR_FIELD2_ACCUM_INC:
 #endif
 FOR_FIELD2_ACCUM_RUN(LBL_FOR_FIELD2_ACCUM_INC, true);
 
 #undef FOR_FIELD2_ACCUM_RUN
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ARRAY_MARK_FALSE_STRIDE:
 #endif
 LBL_ARRAY_MARK_FALSE_STRIDE: {
@@ -4442,9 +5297,19 @@ LBL_ARRAY_MARK_FALSE_STRIDE: {
                          IS_NUMERIC(limit_value) &&
                          IS_NUMERIC(step_value), 1)) {
         ObjArray *arr = AS_ARRAY(array_value);
-        long long index = (long long)AS_NUMBER(index_value);
-        long long limit = (long long)AS_NUMBER(limit_value);
-        long long step = (long long)AS_NUMBER(step_value);
+        int index_int;
+        int limit_int;
+        int step_int;
+        if (!numeric_to_int(index_value, &index_int) ||
+            !numeric_to_int(limit_value, &limit_int) ||
+            !numeric_to_int(step_value, &step_int)) {
+            SAVE_FRAME();
+            vm_runtime_error(vm, "Array stride bounds must be finite integers in range.");
+            return INTERPRET_RUNTIME_ERROR;
+        }
+        long long index = index_int;
+        long long limit = limit_int;
+        long long step = step_int;
         if (__builtin_expect(step <= 0, 0)) {
             SAVE_FRAME();
             vm_runtime_error(vm, "Loop step must be positive.");
@@ -4469,7 +5334,7 @@ LBL_ARRAY_MARK_FALSE_STRIDE: {
 }
 
 /* Closures */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CLOSURE:
 #endif
 LBL_CLOSURE: {
@@ -4487,6 +5352,7 @@ LBL_CLOSURE: {
         } else {
             closure->upvalues[i] = frame->closure->upvalues[index];
         }
+        gc_write_barrier(vm, (Obj *)closure, OBJ_VAL(closure->upvalues[i]));
     }
     DISPATCH();
 }
@@ -4521,6 +5387,7 @@ LBL_CLOSURE: {
     call_new_frame__->closure = call_closure__;                                 \
     call_new_frame__->call_dest = call_base__;                                  \
     call_new_frame__->expected_returns = call_expected__;                       \
+    call_new_frame__->caller_stack_top = vm->stack_top;                         \
     frame = call_new_frame__;                                                  \
     slots = slots + call_base__;                                                \
     ip = call_fn__->chunk.code;                                                 \
@@ -4540,8 +5407,18 @@ LBL_CLOSURE: {
     SAVE_FRAME();                                                               \
     if (IS_NATIVE(slow_callee__)) {                                             \
         ObjNative *native__ = AS_NATIVE(slow_callee__);                         \
+        if (native__->arity >= 0 && native__->arity != slow_arg_count__) {       \
+            vm_runtime_error(vm, "Native %s expected %d arguments but got %d.", \
+                             native__->name->chars, native__->arity,             \
+                             slow_arg_count__);                                  \
+            return INTERPRET_RUNTIME_ERROR;                                     \
+        }                                                                       \
         vm->native_return_count = 0;                                             \
-        Value result__ = native__->function(vm, slow_arg_count__, &slots[slow_base__ + 1]); \
+        void *previous_userdata__ = vm->calling_native_userdata;                \
+        vm->calling_native_userdata = native__->userdata;                        \
+        Value result__ = invoke_native(vm, native__, slow_arg_count__, &slots[slow_base__ + 1]); \
+        vm->calling_native_userdata = previous_userdata__;                      \
+        if (vm->last_error_message[0] != '\0') return INTERPRET_RUNTIME_ERROR;   \
         frame = &vm->frames[vm->frame_count - 1];                               \
         slots = frame->slots;                                                   \
         ip = frame->ip;                                                         \
@@ -4554,7 +5431,7 @@ LBL_CLOSURE: {
         ObjFFI *ffi__ = AS_FFI(slow_callee__);                                  \
         if (ffi__->arity != slow_arg_count__) {                                 \
             vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.",     \
-                             ffi__->name, ffi__->arity, slow_arg_count__);       \
+                             ffi__->name->chars, ffi__->arity, slow_arg_count__); \
             return INTERPRET_RUNTIME_ERROR;                                     \
         }                                                                       \
         double (*fn1__)(double) = (double (*)(double))ffi__->c_function;         \
@@ -4571,7 +5448,7 @@ LBL_CLOSURE: {
             if (!ffi_read_number_arg(vm, ffi__, 1, slots[slow_base__ + 2], &v2__)) return INTERPRET_RUNTIME_ERROR; \
             result__ = NUMBER_VAL(fn2__(v1__, v2__));                           \
         } else {                                                                \
-            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi__->name, ffi__->arity); \
+            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi__->name->chars, ffi__->arity); \
             return INTERPRET_RUNTIME_ERROR;                                     \
         }                                                                       \
         frame = &vm->frames[vm->frame_count - 1];                               \
@@ -4597,7 +5474,7 @@ LBL_CLOSURE: {
 } while (0)
 
 /* Function Calls */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CALLG:
 #endif
 LBL_CALLG: {
@@ -4652,6 +5529,7 @@ LBL_CALLG: {
         new_frame->closure = closure;
         new_frame->call_dest = base;
         new_frame->expected_returns = expected;
+        new_frame->caller_stack_top = vm->stack_top;
 
         frame = new_frame;
         slots = slots + base;
@@ -4672,10 +5550,17 @@ LBL_CALLG: {
 
     if (IS_NATIVE(callee)) {
         ObjNative *native = AS_NATIVE(callee);
+        if (native->arity >= 0 && native->arity != arg_count) {
+            vm_runtime_error(vm, "Native %s expected %d arguments but got %d.",
+                             native->name->chars, native->arity, arg_count);
+            return INTERPRET_RUNTIME_ERROR;
+        }
         vm->native_return_count = 0;
+        void *previous_userdata = vm->calling_native_userdata;
         vm->calling_native_userdata = native->userdata;
-        Value result = native->function(vm, arg_count, &slots[base + 1]);
-        vm->calling_native_userdata = NULL;
+        Value result = invoke_native(vm, native, arg_count, &slots[base + 1]);
+        vm->calling_native_userdata = previous_userdata;
+        if (vm->last_error_message[0] != '\0') return INTERPRET_RUNTIME_ERROR;
         frame = &vm->frames[vm->frame_count - 1];
         slots = frame->slots;
         ip = frame->ip;
@@ -4688,7 +5573,7 @@ LBL_CALLG: {
     if (IS_FFI(callee)) {
         ObjFFI *ffi = AS_FFI(callee);
         if (ffi->arity != arg_count) {
-            vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.", ffi->name, ffi->arity, arg_count);
+            vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.", ffi->name->chars, ffi->arity, arg_count);
             return INTERPRET_RUNTIME_ERROR;
         }
         double (*fn1)(double) = (double (*)(double))ffi->c_function;
@@ -4705,7 +5590,7 @@ LBL_CALLG: {
             if (!ffi_read_number_arg(vm, ffi, 1, slots[base + 2], &v2)) return INTERPRET_RUNTIME_ERROR;
             result = NUMBER_VAL(fn2(v1, v2));
         } else {
-            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name, ffi->arity);
+            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name->chars, ffi->arity);
             return INTERPRET_RUNTIME_ERROR;
         }
         frame = &vm->frames[vm->frame_count - 1];
@@ -4762,6 +5647,7 @@ LBL_CALLG: {
         new_frame->closure = closure;                                              \
         new_frame->call_dest = base;                                               \
         new_frame->expected_returns = expected;                                    \
+        new_frame->caller_stack_top = vm->stack_top;                               \
         frame = new_frame;                                                         \
         slots = slots + base;                                                      \
         ip = fn->chunk.code;                                                       \
@@ -4776,10 +5662,17 @@ LBL_CALLG: {
     SAVE_FRAME();                                                                  \
     if (IS_NATIVE(callee)) {                                                       \
         ObjNative *native = AS_NATIVE(callee);                                     \
+        if (native->arity >= 0 && native->arity != arg_count) {                    \
+            vm_runtime_error(vm, "Native %s expected %d arguments but got %d.",   \
+                             native->name->chars, native->arity, arg_count);       \
+            return INTERPRET_RUNTIME_ERROR;                                        \
+        }                                                                          \
         vm->native_return_count = 0;                                               \
+        void *previous_userdata = vm->calling_native_userdata;                     \
         vm->calling_native_userdata = native->userdata;                            \
-        Value result = native->function(vm, arg_count, &slots[base + 1]);          \
-        vm->calling_native_userdata = NULL;                                        \
+        Value result = invoke_native(vm, native, arg_count, &slots[base + 1]);     \
+        vm->calling_native_userdata = previous_userdata;                           \
+        if (vm->last_error_message[0] != '\0') return INTERPRET_RUNTIME_ERROR;     \
         frame = &vm->frames[vm->frame_count - 1];                                  \
         slots = frame->slots;                                                      \
         ip = frame->ip;                                                            \
@@ -4792,7 +5685,7 @@ LBL_CALLG: {
         ObjFFI *ffi = AS_FFI(callee);                                              \
         if (ffi->arity != arg_count) {                                             \
             vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.",      \
-                             ffi->name, ffi->arity, arg_count);                    \
+                             ffi->name->chars, ffi->arity, arg_count);             \
             return INTERPRET_RUNTIME_ERROR;                                        \
         }                                                                          \
         double (*fn1)(double) = (double (*)(double))ffi->c_function;               \
@@ -4810,7 +5703,7 @@ LBL_CALLG: {
                 return INTERPRET_RUNTIME_ERROR;                                    \
             result = NUMBER_VAL(fn2(v1, v2));                                      \
         } else {                                                                   \
-            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name, ffi->arity); \
+            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name->chars, ffi->arity); \
             return INTERPRET_RUNTIME_ERROR;                                        \
         }                                                                          \
         frame = &vm->frames[vm->frame_count - 1];                                  \
@@ -4835,7 +5728,7 @@ LBL_CALLG: {
     return INTERPRET_RUNTIME_ERROR;                                                \
 } while(0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MCALL:
 #endif
 LBL_MCALL: {
@@ -4897,14 +5790,14 @@ LBL_MCALL: {
     MCALL_DISPATCH_BODY(base, arg_count, expected);                                    \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MCALLFIELD:
 #endif
 LBL_MCALLFIELD: {
     MCALLFIELD_RUN(1);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MCALLFIELD0:
 #endif
 LBL_MCALLFIELD0: {
@@ -4914,7 +5807,7 @@ LBL_MCALLFIELD0: {
 #undef MCALLFIELD_RUN
 #undef MCALL_DISPATCH_BODY
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CALLR:
 #endif
 LBL_CALLR: {
@@ -4931,7 +5824,7 @@ LBL_CALLR: {
     CALL_NON_CLOSURE_SLOW(callee, base, arg_count);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CALLSELF:
 #endif
 LBL_CALLSELF: {
@@ -4944,7 +5837,7 @@ LBL_CALLSELF: {
     CALL_CLOSURE_FAST(closure, base, arg_count, expected);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDUP:
 #endif
 LBL_ADDUP: {
@@ -4960,17 +5853,21 @@ LBL_ADDUP: {
     } else if (IS_OBJ(vb) && IS_OBJ(vc) &&
                AS_OBJ(vb)->type == OBJ_STRING && AS_OBJ(vc)->type == OBJ_STRING) {
         SAVE_FRAME();
-        *loc = OBJ_VAL(concat_strings(vm, (ObjString*)AS_OBJ(vb), (ObjString*)AS_OBJ(vc)));
+        ObjString *joined = concat_strings(vm, (ObjString *)AS_OBJ(vb),
+                                          (ObjString *)AS_OBJ(vc));
+        if (!joined) return INTERPRET_RUNTIME_ERROR;
+        *loc = OBJ_VAL(joined);
         LOAD_FRAME();
     } else {
         SAVE_FRAME();
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
+    gc_write_barrier(vm, (Obj *)upvalue, *loc);
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL:
 #endif
 LBL_ADDLOCAL: {
@@ -4987,17 +5884,19 @@ LBL_ADDLOCAL: {
     } else if (IS_OBJ(vb) && IS_OBJ(vc) &&
                AS_OBJ(vb)->type == OBJ_STRING && AS_OBJ(vc)->type == OBJ_STRING) {
         SAVE_FRAME();
-        R(target) = OBJ_VAL(concat_strings(vm, AS_STRING(vb), AS_STRING(vc)));
+        ObjString *joined = concat_strings(vm, AS_STRING(vb), AS_STRING(vc));
+        if (!joined) return INTERPRET_RUNTIME_ERROR;
+        R(target) = OBJ_VAL(joined);
         LOAD_FRAME();
     } else {
         SAVE_FRAME();
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP(OP_ADDLOCAL, LBL_ADDLOCAL);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL:
 #endif
 LBL_SUBLOCAL: {
@@ -5016,97 +5915,72 @@ LBL_SUBLOCAL: {
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP(OP_SUBLOCAL, LBL_SUBLOCAL);
 }
 
-#define LOCAL_FIELD_PROP_UPDATE(label, operator, allow_concat) do {                     \
-label: {                                                                                \
-    Instruction inst = READ_INST();                                                     \
-    int target = GET_A(inst);                                                           \
-    Value obj = R(GET_B(inst));                                                         \
-    ObjString *name = AS_STRING(K(GET_C(inst)));                                        \
-    Value rhs = NULL_VAL;                                                               \
-    const char *kind = "LookupError";                                                   \
-    const char *message = "Field not found";                                            \
-    const char *hint = NULL;                                                            \
-    char message_buf[256];                                                              \
-    if (__builtin_expect(IS_DICT(obj), 1)) {                                            \
-        if (dict_get_mono_cached(AS_DICT(obj), name, &rhs)) {                           \
-            Value lhs = R(target);                                                       \
-            if (__builtin_expect(IS_NUMBER(lhs) && IS_NUMBER(rhs), 1)) {                \
-                R(target) = NUMBER_VAL(AS_DOUBLE(lhs) operator AS_DOUBLE(rhs));         \
-                DISPATCH();                                                             \
-            } else if (IS_NUMERIC(lhs) && IS_NUMERIC(rhs)) {                            \
-                R(target) = NUMBER_VAL(AS_NUMBER(lhs) operator AS_NUMBER(rhs));         \
-                DISPATCH();                                                             \
-            } else if ((allow_concat) && IS_OBJ(lhs) && IS_OBJ(rhs) &&                  \
-                       AS_OBJ(lhs)->type == OBJ_STRING && AS_OBJ(rhs)->type == OBJ_STRING) { \
-                SAVE_FRAME();                                                           \
-                R(target) = OBJ_VAL(concat_strings(vm, AS_STRING(lhs), AS_STRING(rhs))); \
-                LOAD_FRAME();                                                           \
-                DISPATCH();                                                             \
+#define LOCAL_FIELD_PROP_UPDATE(label, opcode, operator, subtract, allow_concat) do {    \
+label: {                                                                                 \
+    Instruction inst = READ_INST();                                                      \
+    int target = GET_A(inst);                                                            \
+    Value obj = R(GET_B(inst));                                                          \
+    ObjString *name = AS_STRING(K(GET_C(inst)));                                         \
+    Value lhs = R(target);                                                               \
+    Value rhs = NULL_VAL;                                                                \
+    if (__builtin_expect(IS_DICT(obj), 1)) {                                             \
+        ObjDict *dict = AS_DICT(obj);                                                    \
+        if (__builtin_expect(dict->mono_cache_key == name, 1)) {                        \
+            rhs = dict->mono_cache_value;                                                \
+            if (__builtin_expect(IS_NUMBER(lhs) && IS_NUMBER(rhs), 1)) {                 \
+                R(target) = NUMBER_VAL(AS_DOUBLE(lhs) operator AS_DOUBLE(rhs));          \
+                DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP((opcode), label);                     \
             }                                                                            \
-            SAVE_FRAME();                                                               \
-            vm_runtime_error(vm, "Operands must be numbers.");                          \
-            return INTERPRET_RUNTIME_ERROR;                                             \
         }                                                                                \
-        kind = "KeyError";                                                             \
-        snprintf(message_buf, sizeof(message_buf), "Key not found: %.*s",               \
-                 name->length, name->chars);                                            \
-        message = message_buf;                                                          \
-        hint = "Check dict.has(dict, key) or provide a default value.";                 \
     } else if (IS_INSTANCE(obj)) {                                                       \
-        ObjInstance *inst_obj = AS_INSTANCE(obj);                                       \
-        ObjStruct *klass = inst_obj->klass;                                             \
-        Value idx_val;                                                                  \
-        if (table_get(&klass->field_index, name, &idx_val)) {                           \
-            rhs = inst_obj->fields[(int)AS_NUMBER(idx_val)];                            \
-            Value lhs = R(target);                                                       \
+        ObjInstance *instance = AS_INSTANCE(obj);                                        \
+        ObjStruct *klass = instance->klass;                                              \
+        uint32_t cache_slot =                                                           \
+            (((uint32_t)(uintptr_t)klass) ^                                             \
+             ((uint32_t)(uintptr_t)name >> 4)) &                                        \
+            (FIELD_IC_SIZE - 1);                                                        \
+        FieldICEntry *ic = &vm->field_ic[cache_slot];                                   \
+        if (__builtin_expect(ic->klass == klass && ic->name == name, 1)) {              \
+            rhs = instance->fields[ic->index];                                          \
             if (__builtin_expect(IS_NUMBER(lhs) && IS_NUMBER(rhs), 1)) {                \
-                R(target) = NUMBER_VAL(AS_DOUBLE(lhs) operator AS_DOUBLE(rhs));         \
-                DISPATCH();                                                             \
-            } else if (IS_NUMERIC(lhs) && IS_NUMERIC(rhs)) {                            \
-                R(target) = NUMBER_VAL(AS_NUMBER(lhs) operator AS_NUMBER(rhs));         \
-                DISPATCH();                                                             \
-            } else if ((allow_concat) && IS_OBJ(lhs) && IS_OBJ(rhs) &&                  \
-                       AS_OBJ(lhs)->type == OBJ_STRING && AS_OBJ(rhs)->type == OBJ_STRING) { \
-                SAVE_FRAME();                                                           \
-                R(target) = OBJ_VAL(concat_strings(vm, AS_STRING(lhs), AS_STRING(rhs))); \
-                LOAD_FRAME();                                                           \
-                DISPATCH();                                                             \
+                R(target) = NUMBER_VAL(AS_DOUBLE(lhs) operator AS_DOUBLE(rhs));          \
+                DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP((opcode), label);                     \
             }                                                                            \
-            SAVE_FRAME();                                                               \
-            vm_runtime_error(vm, "Operands must be numbers.");                          \
-            return INTERPRET_RUNTIME_ERROR;                                             \
         }                                                                                \
-        kind = "FieldError";                                                           \
-        snprintf(message_buf, sizeof(message_buf), "Field not found: %.*s",             \
-                 name->length, name->chars);                                            \
-        message = message_buf;                                                          \
-        hint = "Check the struct field name.";                                          \
-    } else {                                                                             \
-        kind = "TypeError";                                                            \
-        message = "Value has no fields";                                                \
-        hint = "Use field access on structs, dicts, or error values.";                  \
     }                                                                                    \
     SAVE_FRAME();                                                                        \
-    Value err = make_error_value(vm, kind, message, hint);                              \
+    Value result = NULL_VAL;                                                            \
+    Value error = NULL_VAL;                                                             \
+    LocalFieldUpdateResult update_result = local_field_prop_update_slow(                \
+        vm, obj, name, lhs, (subtract), (allow_concat), &result, &error);                \
+    if (update_result == LOCAL_FIELD_UPDATE_RUNTIME_ERROR) {                            \
+        return INTERPRET_RUNTIME_ERROR;                                                  \
+    }                                                                                    \
     LOAD_FRAME();                                                                        \
+    if (update_result == LOCAL_FIELD_UPDATE_OK) {                                       \
+        R(target) = result;                                                              \
+        DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP((opcode), label);                             \
+    }                                                                                    \
     R(target) = NULL_VAL;                                                                \
-    R(target + 1) = err;                                                                 \
-    RETURN_VALUES(target, 2);                                                           \
-}                                                                                        \
+    R(target + 1) = error;                                                               \
+    RETURN_VALUES(target, 2);                                                            \
+}                                                                                       \
 } while (0)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_FIELD_PROP:
 #endif
-LOCAL_FIELD_PROP_UPDATE(LBL_ADDLOCAL_FIELD_PROP, +, true);
+LOCAL_FIELD_PROP_UPDATE(LBL_ADDLOCAL_FIELD_PROP, OP_ADDLOCAL_FIELD_PROP,
+                        +, false, true);
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_FIELD_PROP:
 #endif
-LOCAL_FIELD_PROP_UPDATE(LBL_SUBLOCAL_FIELD_PROP, -, false);
+LOCAL_FIELD_PROP_UPDATE(LBL_SUBLOCAL_FIELD_PROP, OP_SUBLOCAL_FIELD_PROP,
+                        -, true, false);
 
 #undef LOCAL_FIELD_PROP_UPDATE
 
@@ -5115,13 +5989,17 @@ label: {                                                                       \
     Instruction inst = READ_INST();                                            \
     int target = GET_A(inst);                                                  \
     Value value = R(GET_B(inst));                                              \
-    int32_t length = 0;                                                        \
+    int32_t length;                                                            \
     if (IS_STRING(value)) {                                                    \
         length = AS_STRING(value)->length;                                     \
     } else if (IS_ARRAY(value)) {                                              \
         length = AS_ARRAY(value)->count;                                       \
     } else if (IS_DICT(value)) {                                               \
         length = AS_DICT(value)->count;                                        \
+    } else {                                                                   \
+        SAVE_FRAME();                                                          \
+        vm_runtime_error(vm, "len expected a string, array, or dict.");        \
+        return INTERPRET_RUNTIME_ERROR;                                        \
     }                                                                          \
     Value lhs = R(target);                                                     \
     if (__builtin_expect(IS_INT(lhs), 1)) {                                    \
@@ -5138,12 +6016,12 @@ label: {                                                                       \
     DISPATCH();                                                                \
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_LEN:
 #endif
 LOCAL_LEN_UPDATE(LBL_ADDLOCAL_LEN, +)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_LEN:
 #endif
 LOCAL_LEN_UPDATE(LBL_SUBLOCAL_LEN, -)
@@ -5229,6 +6107,9 @@ label: {                                                                  \
         if (__builtin_expect(IS_INT(vs), 1)) {                             \
             R(target) = NUMBER_VAL(base op ((double)AS_INT(vs) / divisor)); \
             DISPATCH();                                                    \
+        } else if (IS_NUMBER(vs)) {                                        \
+            R(target) = NUMBER_VAL(base op (AS_DOUBLE(vs) / divisor));     \
+            DISPATCH();                                                    \
         }                                                                  \
     } else if (__builtin_expect(IS_NUMBER(vt), 1)) {                      \
         double base = AS_DOUBLE(vt);                                       \
@@ -5256,13 +6137,13 @@ label: {                                                                  \
     Value vs = R(GET_B(inst));                                             \
     int divisor = GET_sC(inst);                                            \
     if (__builtin_expect(IS_INT(vt) && IS_INT(vs) && divisor != 0, 1)) {  \
-        int32_t mod_result = AS_INT(vs) % divisor;                         \
+        int32_t mod_result = int32_mod_immediate_nonzero(AS_INT(vs), divisor); \
         R(target) = int_or_number((long long)AS_INT(vt) op (long long)mod_result); \
         DISPATCH();                                                        \
     }                                                                      \
     double rhs;                                                            \
     if (__builtin_expect(IS_INT(vs) && divisor != 0, 1)) {                 \
-        rhs = (double)(AS_INT(vs) % divisor);                              \
+        rhs = (double)int32_mod_immediate_nonzero(AS_INT(vs), divisor);    \
     } else if (IS_NUMERIC(vs)) {                                           \
         rhs = number_mod_i(AS_NUMBER(vs), divisor);                        \
     } else {                                                               \
@@ -5282,42 +6163,42 @@ label: {                                                                  \
     DISPATCH();                                                            \
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_MULI:
 #endif
 LOCAL_MULI_UPDATE(LBL_ADDLOCAL_MULI, +)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_MULI:
 #endif
 LOCAL_MULI_UPDATE(LBL_SUBLOCAL_MULI, -)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_MULK:
 #endif
 LOCAL_MULK_UPDATE(LBL_ADDLOCAL_MULK, +)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_MULK:
 #endif
 LOCAL_MULK_UPDATE(LBL_SUBLOCAL_MULK, -)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_DIVI:
 #endif
 LOCAL_DIVI_UPDATE(LBL_ADDLOCAL_DIVI, +)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_DIVI:
 #endif
 LOCAL_DIVI_UPDATE(LBL_SUBLOCAL_DIVI, -)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDLOCAL_MODI:
 #endif
 LOCAL_MODI_UPDATE(LBL_ADDLOCAL_MODI, +)
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBLOCAL_MODI:
 #endif
 LOCAL_MODI_UPDATE(LBL_SUBLOCAL_MODI, -)
@@ -5327,7 +6208,7 @@ LOCAL_MODI_UPDATE(LBL_SUBLOCAL_MODI, -)
 #undef LOCAL_DIVI_UPDATE
 #undef LOCAL_MODI_UPDATE
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CALL:
 #endif
 LBL_CALL: {
@@ -5366,6 +6247,7 @@ LBL_CALL: {
         new_frame->closure = closure;
         new_frame->call_dest = base;
         new_frame->expected_returns = expected;
+        new_frame->caller_stack_top = vm->stack_top;
 
         frame = new_frame;
         slots = slots + base;
@@ -5387,10 +6269,17 @@ LBL_CALL: {
 
     if (IS_NATIVE(callee)) {
         ObjNative *native = AS_NATIVE(callee);
+        if (native->arity >= 0 && native->arity != arg_count) {
+            vm_runtime_error(vm, "Native %s expected %d arguments but got %d.",
+                             native->name->chars, native->arity, arg_count);
+            return INTERPRET_RUNTIME_ERROR;
+        }
         vm->native_return_count = 0;
+        void *previous_userdata = vm->calling_native_userdata;
         vm->calling_native_userdata = native->userdata;
-        Value result = native->function(vm, arg_count, &slots[base + 1]);
-        vm->calling_native_userdata = NULL;
+        Value result = invoke_native(vm, native, arg_count, &slots[base + 1]);
+        vm->calling_native_userdata = previous_userdata;
+        if (vm->last_error_message[0] != '\0') return INTERPRET_RUNTIME_ERROR;
         frame = &vm->frames[vm->frame_count - 1];
         slots = frame->slots;
         ip = frame->ip;
@@ -5403,7 +6292,7 @@ LBL_CALL: {
     if (IS_FFI(callee)) {
         ObjFFI *ffi = AS_FFI(callee);
         if (ffi->arity != arg_count) {
-            vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.", ffi->name, ffi->arity, arg_count);
+            vm_runtime_error(vm, "FFI %s expected %d arguments but got %d.", ffi->name->chars, ffi->arity, arg_count);
             return INTERPRET_RUNTIME_ERROR;
         }
         double (*fn1)(double) = (double (*)(double))ffi->c_function;
@@ -5420,7 +6309,7 @@ LBL_CALL: {
             if (!ffi_read_number_arg(vm, ffi, 1, slots[base + 2], &v2)) return INTERPRET_RUNTIME_ERROR;
             result = NUMBER_VAL(fn2(v1, v2));
         } else {
-            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name, ffi->arity);
+            vm_runtime_error(vm, "FFI %s: Unsupported arity %d", ffi->name->chars, ffi->arity);
             return INTERPRET_RUNTIME_ERROR;
         }
         frame = &vm->frames[vm->frame_count - 1];
@@ -5448,7 +6337,7 @@ LBL_CALL: {
 }
 
 /* --- Return --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_RETURN:
 #endif
 LBL_RETURN: {
@@ -5459,7 +6348,7 @@ LBL_RETURN: {
 }
 
 /* --- Data Structures --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEWARRAY:
 #endif
 LBL_NEWARRAY: {
@@ -5471,7 +6360,12 @@ LBL_NEWARRAY: {
         int cap = 8;
         while (cap < hint) cap *= 2;
         arr->capacity = cap;
-        arr->items = realloc(arr->items, sizeof(Value) * cap);
+        arr->items = malloc(sizeof(Value) * (size_t)cap);
+        if (!arr->items) {
+            SAVE_FRAME();
+            vm_runtime_error(vm, "Out of memory allocating array.");
+            return INTERPRET_RUNTIME_ERROR;
+        }
         vm->bytes_allocated += sizeof(Value) * cap;
         for (int i = 0; i < cap; i++) arr->items[i] = NULL_VAL;
     }
@@ -5479,7 +6373,7 @@ LBL_NEWARRAY: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETARRAY:
 #endif
 LBL_SETARRAY: {
@@ -5494,11 +6388,12 @@ LBL_SETARRAY: {
             array_push(vm, arr, NULL_VAL);
         }
         arr->items[idx] = val;
+        gc_write_barrier(vm, (Obj *)arr, val);
     }
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ARRAY_PUSH:
 #endif
 LBL_ARRAY_PUSH: {
@@ -5507,7 +6402,9 @@ LBL_ARRAY_PUSH: {
     if (IS_ARRAY(arr_val)) {
         ObjArray *arr = AS_ARRAY(arr_val);
         if (__builtin_expect(arr->capacity >= arr->count + 1, 1)) {
-            arr->items[arr->count++] = R(GET_B(inst));
+            Value value = R(GET_B(inst));
+            arr->items[arr->count++] = value;
+            gc_write_barrier(vm, (Obj *)arr, value);
         } else {
             array_push(vm, arr, R(GET_B(inst)));
         }
@@ -5515,7 +6412,7 @@ LBL_ARRAY_PUSH: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETINDEX:
 #endif
 LBL_GETINDEX: {
@@ -5523,10 +6420,27 @@ LBL_GETINDEX: {
     Value obj = R(GET_B(inst));
     Value idx = R(GET_C(inst));
 
-    if (IS_ARRAY(obj) && IS_NUMERIC(idx)) {
-        int i = IS_INT(idx) ? AS_INT(idx) : (int)AS_DOUBLE(idx);
+    if (__builtin_expect(IS_ARRAY(obj), 1)) {
         ObjArray *arr = AS_ARRAY(obj);
-        R(GET_A(inst)) = (i >= 0 && i < arr->count) ? arr->items[i] : NULL_VAL;
+        int i;
+        if (__builtin_expect(IS_NUMBER(idx), 1)) {
+            double number = AS_DOUBLE(idx);
+            if (__builtin_expect(number >= 0.0 &&
+                                 number < (double)arr->count, 1)) {
+                R(GET_A(inst)) = arr->items[(int)number];
+                DISPATCH();
+            }
+        } else if (__builtin_expect(IS_INT(idx), 1)) {
+            i = AS_INT(idx);
+            R(GET_A(inst)) =
+                (uint32_t)i < (uint32_t)arr->count ? arr->items[i] : NULL_VAL;
+            DISPATCH();
+        } else {
+            R(GET_A(inst)) = NULL_VAL;
+            DISPATCH();
+        }
+        R(GET_A(inst)) = numeric_to_int(idx, &i) && i >= 0 && i < arr->count
+            ? arr->items[i] : NULL_VAL;
     } else if (IS_DICT(obj) && IS_STRING(idx)) {
         Value val;
         if (dict_get_mono_cached(AS_DICT(obj), AS_STRING(idx), &val)) {
@@ -5536,8 +6450,8 @@ LBL_GETINDEX: {
         }
     } else if (IS_STRING(obj) && IS_NUMERIC(idx)) {
         ObjString *str = AS_STRING(obj);
-        int i = (int)AS_NUMBER(idx);
-        if (i >= 0 && i < str->length) {
+        int i;
+        if (numeric_to_int(idx, &i) && i >= 0 && i < str->length) {
             SAVE_FRAME();
             char ch = string_char_at(str, i);
             R(GET_A(inst)) = OBJ_VAL(copy_string(vm, &ch, 1));
@@ -5551,7 +6465,7 @@ LBL_GETINDEX: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETINDEX_TRY:
 #endif
 LBL_GETINDEX_TRY: {
@@ -5567,9 +6481,13 @@ LBL_GETINDEX_TRY: {
 
     if (IS_ARRAY(obj)) {
         if (IS_NUMERIC(idx)) {
-            int i = IS_INT(idx) ? AS_INT(idx) : (int)AS_DOUBLE(idx);
+            int i;
             ObjArray *arr = AS_ARRAY(obj);
-            if (i >= 0 && i < arr->count) {
+            if (!numeric_to_int(idx, &i)) {
+                kind = "IndexError";
+                snprintf(message, sizeof(message), "Array index is outside the supported range");
+                hint = "Use a finite index within the array length.";
+            } else if (i >= 0 && i < arr->count) {
                 result = arr->items[i];
                 ok = true;
             } else {
@@ -5601,8 +6519,12 @@ LBL_GETINDEX_TRY: {
     } else if (IS_STRING(obj)) {
         if (IS_NUMERIC(idx)) {
             ObjString *str = AS_STRING(obj);
-            int i = IS_INT(idx) ? AS_INT(idx) : (int)AS_DOUBLE(idx);
-            if (i >= 0 && i < str->length) {
+            int i;
+            if (!numeric_to_int(idx, &i)) {
+                kind = "IndexError";
+                snprintf(message, sizeof(message), "String index is outside the supported range");
+                hint = "Use a finite index within the string length.";
+            } else if (i >= 0 && i < str->length) {
                 SAVE_FRAME();
                 char ch = string_char_at(str, i);
                 result = OBJ_VAL(copy_string(vm, &ch, 1));
@@ -5636,7 +6558,7 @@ LBL_GETINDEX_TRY: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETINDEX:
 #endif
 LBL_SETINDEX: {
@@ -5645,20 +6567,45 @@ LBL_SETINDEX: {
     Value idx = R(GET_B(inst));
     Value val = R(GET_C(inst));
 
-    if (IS_ARRAY(obj) && IS_NUMERIC(idx)) {
-        int i = IS_INT(idx) ? AS_INT(idx) : (int)AS_DOUBLE(idx);
+    if (__builtin_expect(IS_ARRAY(obj), 1)) {
+        int i;
         ObjArray *arr = AS_ARRAY(obj);
+        if (__builtin_expect(IS_NUMBER(idx), 1)) {
+            double number = AS_DOUBLE(idx);
+            if (__builtin_expect(number >= 0.0 &&
+                                 number < (double)arr->count, 1)) {
+                i = (int)number;
+                arr->items[i] = val;
+                gc_write_barrier(vm, (Obj *)arr, val);
+                DISPATCH();
+            }
+        } else if (__builtin_expect(IS_INT(idx), 1)) {
+            i = AS_INT(idx);
+            if (__builtin_expect((uint32_t)i < (uint32_t)arr->count, 1)) {
+                arr->items[i] = val;
+                gc_write_barrier(vm, (Obj *)arr, val);
+                DISPATCH();
+            }
+        } else {
+            DISPATCH();
+        }
+        if (!numeric_to_int(idx, &i) || i < 0) {
+            SAVE_FRAME();
+            vm_runtime_error(vm, "Array index must be a non-negative integer in range.");
+            return INTERPRET_RUNTIME_ERROR;
+        }
         while (arr->count <= i) {
             array_push(vm, arr, NULL_VAL);
         }
         arr->items[i] = val;
+        gc_write_barrier(vm, (Obj *)arr, val);
     } else if (IS_DICT(obj) && IS_STRING(idx)) {
         dict_set(vm, AS_DICT(obj), AS_STRING(idx), val);
     }
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEWDICT:
 #endif
 LBL_NEWDICT: {
@@ -5675,7 +6622,7 @@ LBL_NEWDICT: {
 }
 
 /* --- Field Access --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETFIELD:
 #endif
 LBL_GETFIELD: {
@@ -5690,6 +6637,7 @@ LBL_GETFIELD: {
                               (FIELD_IC_SIZE - 1);
         FieldICEntry *field_ic = &vm->field_ic[field_slot];
         if (__builtin_expect(field_ic->klass == klass && field_ic->name == name, 1)) {
+            TRY_FUSE_NUMERIC_FIELD_ADD(inst_obj, field_ic->index, inst);
             R(GET_A(inst)) = inst_obj->fields[field_ic->index];
             DISPATCH();
         }
@@ -5699,6 +6647,7 @@ LBL_GETFIELD: {
             field_ic->klass = klass;
             field_ic->name = name;
             field_ic->index = idx;
+            TRY_FUSE_NUMERIC_FIELD_ADD(inst_obj, idx, inst);
             R(GET_A(inst)) = inst_obj->fields[idx];
             DISPATCH();
         }
@@ -5759,7 +6708,9 @@ LBL_GETFIELD: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#undef TRY_FUSE_NUMERIC_FIELD_ADD
+
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETFIELD_TRY:
 #endif
 LBL_GETFIELD_TRY: {
@@ -5833,7 +6784,7 @@ LBL_GETFIELD_TRY: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETFIELD_PROP:
 #endif
 LBL_GETFIELD_PROP: {
@@ -5903,7 +6854,7 @@ LBL_GETFIELD_PROP: {
     RETURN_VALUES(dest, 2);
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETFIELD:
 #endif
 LBL_SETFIELD: {
@@ -5951,7 +6902,7 @@ LBL_SETFIELD: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_GETFIELD_IDX:
 #endif
 LBL_GETFIELD_IDX: {
@@ -5966,7 +6917,7 @@ LBL_GETFIELD_IDX: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SETFIELD_IDX:
 #endif
 LBL_SETFIELD_IDX: {
@@ -5982,7 +6933,7 @@ LBL_SETFIELD_IDX: {
 }
 
 /* --- Iterators --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ITER_PREP:
 #endif
 LBL_ITER_PREP: {
@@ -5992,7 +6943,7 @@ LBL_ITER_PREP: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ITER_NEXT:
 #endif
 LBL_ITER_NEXT: {
@@ -6000,7 +6951,12 @@ LBL_ITER_NEXT: {
     int var_reg = GET_A(inst);
     int iter_reg = GET_B(inst);
     int jump_dist = GET_C(inst);
-    int idx = (int)AS_NUMBER(R(iter_reg));
+    int idx;
+    if (!numeric_to_int(R(iter_reg), &idx) || idx < 0) {
+        SAVE_FRAME();
+        vm_runtime_error(vm, "Iterator state is invalid.");
+        return INTERPRET_RUNTIME_ERROR;
+    }
 
     /* The iterable is in the register before the iterator state */
     Value iterable = R(iter_reg - 1);
@@ -6033,7 +6989,7 @@ LBL_ITER_NEXT: {
 }
 
 /* --- Fused Ternary Arithmetic --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADDSUB:
 #endif
 LBL_ADDSUB: {
@@ -6054,10 +7010,10 @@ LBL_ADDSUB: {
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_ADJACENT_ARITHMETIC();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUBADD:
 #endif
 LBL_SUBADD: {
@@ -6078,10 +7034,10 @@ LBL_SUBADD: {
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_ADJACENT_ARITHMETIC();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MULADD:
 #endif
 LBL_MULADD: {
@@ -6102,10 +7058,10 @@ LBL_MULADD: {
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_ADJACENT_ARITHMETIC();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MULSUB:
 #endif
 LBL_MULSUB: {
@@ -6126,26 +7082,19 @@ LBL_MULSUB: {
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
     }
-    DISPATCH();
+    DISPATCH_OR_RUN_ADJACENT_ARITHMETIC();
 }
 
 /* --- Fused Comparison-of-Sum --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADD_GT_TEST:
 #endif
 LBL_ADD_GT_TEST: {
     Instruction inst = READ_INST();
     Value va = R(GET_A(inst));
     Value vb = R(GET_B(inst));
-    int imm = GET_sC(inst);
     bool result;
-    if (__builtin_expect(IS_NUMBER(va) && IS_NUMBER(vb), 1)) {
-        result = (AS_DOUBLE(va) + AS_DOUBLE(vb)) > (double)imm;
-    } else if (IS_INT(va) && IS_INT(vb)) {
-        result = (long long)AS_INT(va) + (long long)AS_INT(vb) > (long long)imm;
-    } else if (IS_NUMERIC(va) && IS_NUMERIC(vb)) {
-        result = (AS_NUMBER(va) + AS_NUMBER(vb)) > (double)imm;
-    } else {
+    if (!numeric_sum_greater(va, vb, GET_sC(inst), false, &result)) {
         SAVE_FRAME();
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
@@ -6159,22 +7108,15 @@ LBL_ADD_GT_TEST: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_ADD_GE_TEST:
 #endif
 LBL_ADD_GE_TEST: {
     Instruction inst = READ_INST();
     Value va = R(GET_A(inst));
     Value vb = R(GET_B(inst));
-    int imm = GET_sC(inst);
     bool result;
-    if (__builtin_expect(IS_NUMBER(va) && IS_NUMBER(vb), 1)) {
-        result = (AS_DOUBLE(va) + AS_DOUBLE(vb)) >= (double)imm;
-    } else if (IS_INT(va) && IS_INT(vb)) {
-        result = (long long)AS_INT(va) + (long long)AS_INT(vb) >= (long long)imm;
-    } else if (IS_NUMERIC(va) && IS_NUMERIC(vb)) {
-        result = (AS_NUMBER(va) + AS_NUMBER(vb)) >= (double)imm;
-    } else {
+    if (!numeric_sum_greater(va, vb, GET_sC(inst), true, &result)) {
         SAVE_FRAME();
         vm_runtime_error(vm, "Operands must be numbers.");
         return INTERPRET_RUNTIME_ERROR;
@@ -6188,7 +7130,7 @@ LBL_ADD_GE_TEST: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUB_GT_TEST:
 #endif
 LBL_SUB_GT_TEST: {
@@ -6217,7 +7159,7 @@ LBL_SUB_GT_TEST: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_SUB_GE_TEST:
 #endif
 LBL_SUB_GE_TEST: {
@@ -6247,7 +7189,7 @@ LBL_SUB_GE_TEST: {
 }
 
 /* --- Fused Multiply-Accumulate into Local --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MULLOCAL_ADD:
 #endif
 LBL_MULLOCAL_ADD: {
@@ -6255,13 +7197,16 @@ LBL_MULLOCAL_ADD: {
     int target = GET_A(inst);
     Value vb = R(GET_B(inst));
     Value vc = R(GET_C(inst));
-    if (__builtin_expect(IS_INT(vb) && IS_INT(vc), 1)) {
-        R(target) = int_or_number((long long)AS_INT(vb) * (long long)AS_INT(vc) + (IS_INT(R(target)) ? (long long)AS_INT(R(target)) : (long long)AS_NUMBER(R(target))));
-    } else if (__builtin_expect(IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
-        double acc = IS_NUMBER(R(target)) ? AS_DOUBLE(R(target)) : AS_NUMBER(R(target));
+    Value accumulator = R(target);
+    if (__builtin_expect(IS_INT(accumulator) && IS_INT(vb) && IS_INT(vc), 1)) {
+        R(target) = int_or_number((long long)AS_INT(vb) * (long long)AS_INT(vc) +
+                                  (long long)AS_INT(accumulator));
+    } else if (__builtin_expect(IS_NUMERIC(accumulator) &&
+                                IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
+        double acc = AS_NUMBER(accumulator);
         R(target) = NUMBER_VAL(AS_DOUBLE(vb) * AS_DOUBLE(vc) + acc);
-    } else if (IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
-        double acc = AS_NUMBER(R(target));
+    } else if (IS_NUMERIC(accumulator) && IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
+        double acc = AS_NUMBER(accumulator);
         R(target) = NUMBER_VAL(AS_NUMBER(vb) * AS_NUMBER(vc) + acc);
     } else {
         SAVE_FRAME();
@@ -6271,7 +7216,7 @@ LBL_MULLOCAL_ADD: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_MULLOCAL_SUB:
 #endif
 LBL_MULLOCAL_SUB: {
@@ -6279,13 +7224,16 @@ LBL_MULLOCAL_SUB: {
     int target = GET_A(inst);
     Value vb = R(GET_B(inst));
     Value vc = R(GET_C(inst));
-    if (__builtin_expect(IS_INT(vb) && IS_INT(vc), 1)) {
-        R(target) = int_or_number((IS_INT(R(target)) ? (long long)AS_INT(R(target)) : (long long)AS_NUMBER(R(target))) - (long long)AS_INT(vb) * (long long)AS_INT(vc));
-    } else if (__builtin_expect(IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
-        double acc = IS_NUMBER(R(target)) ? AS_DOUBLE(R(target)) : AS_NUMBER(R(target));
+    Value accumulator = R(target);
+    if (__builtin_expect(IS_INT(accumulator) && IS_INT(vb) && IS_INT(vc), 1)) {
+        R(target) = int_or_number((long long)AS_INT(accumulator) -
+                                  (long long)AS_INT(vb) * (long long)AS_INT(vc));
+    } else if (__builtin_expect(IS_NUMERIC(accumulator) &&
+                                IS_NUMBER(vb) && IS_NUMBER(vc), 1)) {
+        double acc = AS_NUMBER(accumulator);
         R(target) = NUMBER_VAL(acc - AS_DOUBLE(vb) * AS_DOUBLE(vc));
-    } else if (IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
-        double acc = AS_NUMBER(R(target));
+    } else if (IS_NUMERIC(accumulator) && IS_NUMERIC(vb) && IS_NUMERIC(vc)) {
+        double acc = AS_NUMBER(accumulator);
         R(target) = NUMBER_VAL(acc - AS_NUMBER(vb) * AS_NUMBER(vc));
     } else {
         SAVE_FRAME();
@@ -6296,7 +7244,7 @@ LBL_MULLOCAL_SUB: {
 }
 
 /* --- Misc --- */
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_AUX:
 #endif
 LBL_AUX: {
@@ -6304,7 +7252,7 @@ LBL_AUX: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_CLOSE_UPVAL:
 #endif
 LBL_CLOSE_UPVAL: {
@@ -6313,7 +7261,7 @@ LBL_CLOSE_UPVAL: {
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_DEFER:
 #endif
 LBL_DEFER: {
@@ -6321,16 +7269,31 @@ LBL_DEFER: {
     Value val = R(GET_A(inst));
     if (IS_CLOSURE(val)) {
         if (vm->defer_stack.count >= vm->defer_stack.capacity) {
-            vm->defer_stack.capacity = vm->defer_stack.capacity < 8 ? 8 : vm->defer_stack.capacity * 2;
-            vm->defer_stack.items = realloc(vm->defer_stack.items,
-                sizeof(ObjClosure *) * vm->defer_stack.capacity);
+            int old_capacity = vm->defer_stack.capacity;
+            if (old_capacity > INT_MAX / 2) {
+                SAVE_FRAME();
+                vm_runtime_error(vm, "Too many deferred calls.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            int new_capacity = old_capacity < 8 ? 8 : old_capacity * 2;
+            ObjClosure **items = realloc(vm->defer_stack.items,
+                sizeof(ObjClosure *) * (size_t)new_capacity);
+            if (!items) {
+                SAVE_FRAME();
+                vm_runtime_error(vm, "Out of memory storing deferred call.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            vm->defer_stack.items = items;
+            vm->defer_stack.capacity = new_capacity;
+            vm->bytes_allocated +=
+                sizeof(ObjClosure *) * (size_t)(new_capacity - old_capacity);
         }
         vm->defer_stack.items[vm->defer_stack.count++] = AS_CLOSURE(val);
     }
     DISPATCH();
 }
 
-#ifndef __GNUC__
+#if !defined(__GNUC__) && !defined(__clang__)
     case OP_NEWSTRUCT:
 #endif
 LBL_NEWSTRUCT: {
@@ -6343,6 +7306,12 @@ LBL_NEWSTRUCT: {
     int field_count = GET_OPCODE(fc_inst);
     s->field_count = field_count;
     s->field_names = (ObjString **)malloc(sizeof(ObjString *) * field_count);
+    if (field_count > 0 && !s->field_names) {
+        SAVE_FRAME();
+        vm_runtime_error(vm, "Out of memory allocating struct fields.");
+        return INTERPRET_RUNTIME_ERROR;
+    }
+    vm->bytes_allocated += sizeof(ObjString *) * (size_t)field_count;
 
     /* Read field name constant indices */
     for (int i = 0; i < field_count; i++) {
@@ -6357,11 +7326,23 @@ LBL_NEWSTRUCT: {
 }
 
     /* End of dispatch - should never reach here */
-#ifndef __GNUC__
+#if defined(__GNUC__) || defined(__clang__)
+LBL_INVALID_OPCODE:
+    SAVE_FRAME();
+    vm_runtime_error(vm, "Invalid bytecode opcode %u.",
+                     (unsigned)GET_OPCODE(*ip));
+    return INTERPRET_RUNTIME_ERROR;
+#else
+#if !defined(__GNUC__) && !defined(__clang__)
     default:
+        SAVE_FRAME();
+        vm_runtime_error(vm, "Invalid bytecode opcode %u.",
+                         (unsigned)GET_OPCODE(*ip));
         return INTERPRET_RUNTIME_ERROR;
     } /* end switch */
 #endif
+#endif
+    vm_runtime_error(vm, "Bytecode execution stopped unexpectedly.");
     return INTERPRET_RUNTIME_ERROR;
 
     #undef READ_INST
@@ -6372,6 +7353,12 @@ LBL_NEWSTRUCT: {
     #undef SAVE_FRAME
     #undef LOAD_FRAME
     #undef CHECK_CANCEL
+    #undef CHECK_LOOP_CANCEL
+    #undef DISPATCH_OR_RUN_LOOP
+    #undef DISPATCH_RANGE_BODY_OR_NORMAL
+    #undef DISPATCH_OR_RUN_NUMERIC_RANGE_LOOP
+    #undef DISPATCH_OR_RUN_ADJACENT_ARITHMETIC
+    #undef STORE_COMPARISON_RESULT
     #undef STORE_SINGLE_RESULT
     #undef STORE_NATIVE_RESULT
 }
@@ -6396,10 +7383,10 @@ bool vm_set_global_value(VM *vm, const char *name, Value value) {
     if (!vm || !name) return false;
     vm_push(vm, value);
     ObjString *key = copy_string(vm, name, (int)strlen(name));
-    bool ok = table_set(&vm->globals, key, value);
+    table_set(&vm->globals, key, value);
     vm_pop(vm);
     memset(vm->global_ic, 0, sizeof(vm->global_ic));
-    return ok;
+    return true;
 }
 
 bool vm_get_global_value(VM *vm, const char *name, Value *out) {
@@ -6410,17 +7397,20 @@ bool vm_get_global_value(VM *vm, const char *name, Value *out) {
 
 void vm_register_native(VM *vm, const char *name, NativeFn function, int arity,
                         void *userdata, void (*userdata_finalizer)(void *)) {
-    if (!vm || !name || !function) return;
-    define_native_with_userdata(vm, name, function, arity, userdata, userdata_finalizer);
+    if (!vm || !name || !function || arity < -1 || arity > 255) return;
+    define_native_with_userdata(vm, name, function, arity, userdata,
+                                userdata_finalizer, true);
     memset(vm->global_ic, 0, sizeof(vm->global_ic));
 }
 
 ObjFFI *vm_register_ffi(VM *vm, const char *name, void *c_func, int arity) {
-    if (!vm || !name || !c_func) return NULL;
+    if (!vm || !name || !c_func || (arity != 1 && arity != 2)) return NULL;
     ObjString *key = copy_string(vm, name, (int)strlen(name));
-    ObjFFI *ffi = new_ffi(vm, c_func, key->chars, arity);
+    vm_push(vm, OBJ_VAL(key));
+    ObjFFI *ffi = new_ffi(vm, c_func, key, arity);
     vm_push(vm, OBJ_VAL(ffi));
     table_set(&vm->globals, key, OBJ_VAL(ffi));
+    vm_pop(vm);
     vm_pop(vm);
     memset(vm->global_ic, 0, sizeof(vm->global_ic));
     return ffi;
@@ -6439,17 +7429,19 @@ ObjNativeHandle *vm_new_native_handle(VM *vm, const char *type_name, void *data,
 bool vm_native_handle_set_method(VM *vm, ObjNativeHandle *handle, const char *name,
                                  NativeFn function, int arity,
                                  void *userdata, void (*userdata_finalizer)(void *)) {
-    if (!vm || !handle || !name || !function) return false;
+    if (!vm || !handle || !name || !function || arity < -1 || arity > 255) return false;
     vm_push(vm, OBJ_VAL(handle));
     ObjString *key = copy_string(vm, name, (int)strlen(name));
-    ObjNative *native = new_native(vm, function, key->chars, arity);
+    vm_push(vm, OBJ_VAL(key));
+    ObjNative *native = new_native(vm, function, key, arity);
     native->userdata = userdata;
     native->userdata_finalizer = userdata_finalizer;
     vm_push(vm, OBJ_VAL(native));
-    bool ok = dict_set(vm, handle->methods, key, OBJ_VAL(native));
+    dict_set(vm, handle->methods, key, OBJ_VAL(native));
     vm_pop(vm);
     vm_pop(vm);
-    return ok;
+    vm_pop(vm);
+    return true;
 }
 
 void *vm_native_handle_data(Value value, const char *type_name) {
@@ -6467,6 +7459,7 @@ Value vm_native_handle_value(ObjNativeHandle *handle) {
 }
 
 ObjFunction *vm_compile_named(VM *vm, const char *source, const char *name) {
+    if (!vm || !source) return NULL;
     vm_clear_error(vm);
     /* Parse */
     bool had_error = false;
@@ -6511,13 +7504,18 @@ static InterpretResult vm_run_closure(VM *vm, ObjClosure *closure) {
     frame->slots = vm->stack;
     frame->call_dest = 0;
     frame->expected_returns = 1;
+    frame->caller_stack_top = 0;
     vm->frame_count = 1;
 
     return vm_execute(vm);
 }
 
 InterpretResult vm_run_function(VM *vm, ObjFunction *function) {
+    if (!vm || !function) return INTERPRET_RUNTIME_ERROR;
     vm_clear_error(vm);
+    vm->yield_requested = false;
+    vm->yield_count = 0;
+    vm->native_return_count = 0;
     /* Root the function while allocating its closure. */
     vm_push(vm, OBJ_VAL(function));
     ObjClosure *closure = new_closure(vm, function);
@@ -6533,6 +7531,16 @@ InterpretResult vm_run_function(VM *vm, ObjFunction *function) {
         result = vm_run_closure(vm, task);
     }
 
+    close_upvalues(vm, vm->stack);
+    clear_upvalue_cache(vm);
+    if (result != INTERPRET_OK) {
+        vm->task_queue.count = 0;
+    }
+    vm->defer_stack.count = 0;
+    vm->yield_requested = false;
+    vm->yield_count = 0;
+    vm->native_return_count = 0;
+    vm->calling_native_userdata = NULL;
     clear_stack_range(vm, 0, vm->stack_top);
     vm->stack_size = 0;
     vm->stack_top = 0;

@@ -174,6 +174,39 @@ for test_file in "$TEST_DIR"/test_*.mg; do
     fi
 done
 
+# Exercise the file-loading path with a byte sequence that cannot be stored in
+# a normal tracked text fixture. The CLI must reject the whole source instead
+# of silently compiling only the prefix before the NUL.
+CLI_NUL_TEST="test_cli_embedded_nul"
+if [ -z "$FILTER" ] || [[ "$CLI_NUL_TEST" == *"$FILTER"* ]]; then
+    NUL_FILE=$(mktemp "${TMPDIR:-/tmp}/magnesium-nul.XXXXXX.mg")
+    printf 'print("before")\0print("after")\n' > "$NUL_FILE"
+    set +e
+    NUL_OUTPUT=$(timeout "$TIMEOUT" "$BINARY" "$NUL_FILE" 2>&1)
+    NUL_EXIT_CODE=$?
+    set -e
+    case "$NUL_FILE" in
+        "${TMPDIR:-/tmp}"/magnesium-nul.*.mg) rm -f -- "$NUL_FILE" ;;
+        *) echo "Refusing to remove unexpected temporary path: $NUL_FILE" >&2 ;;
+    esac
+
+    if [ "$NUL_EXIT_CODE" -eq 65 ] &&
+            [[ "$NUL_OUTPUT" == *"embedded NUL byte"* ]] &&
+            [[ "$NUL_OUTPUT" != *"before"* ]] &&
+            [[ "$NUL_OUTPUT" != *"after"* ]]; then
+        echo -e "  ${GREEN}PASS${RESET}  $CLI_NUL_TEST"
+        PASSED=$((PASSED + 1))
+    else
+        echo -e "  ${RED}FAIL${RESET}  $CLI_NUL_TEST"
+        FAILED=$((FAILED + 1))
+        ERRORS="$ERRORS\n  - $CLI_NUL_TEST: expected exit 65 and embedded-NUL diagnostic"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "    exit code: $NUL_EXIT_CODE"
+            printf '%s\n' "$NUL_OUTPUT" | sed 's/^/    | /'
+        fi
+    fi
+fi
+
 # Summary
 echo "------------------------------------------------"
 TOTAL=$((PASSED + FAILED + SKIPPED))

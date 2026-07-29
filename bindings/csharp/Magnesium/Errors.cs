@@ -56,15 +56,22 @@ namespace Magnesium
         public static InterpretResult Ok() => new InterpretResult(true);
         public static InterpretResult Err(InterpretError e) => new InterpretResult(false, e);
 
-        public static InterpretResult FromRaw(int raw)
+        public static InterpretResult FromRaw(int raw, string? runtimeErrorMessage = null)
         {
             return raw switch
             {
                 0 => Ok(),
                 1 => Err(new InterpretError(InterpretErrorKind.CompileError, "Compile error")),
-                2 => Err(new InterpretError(InterpretErrorKind.RuntimeError, "Runtime error")),
+                2 => Err(new InterpretError(
+                    InterpretErrorKind.RuntimeError,
+                    string.IsNullOrEmpty(runtimeErrorMessage)
+                        ? "Runtime error"
+                        : runtimeErrorMessage,
+                    runtimeErrorMessage)),
                 3 => Err(new InterpretError(InterpretErrorKind.Yield, "Yield")),
-                _ => Ok(),
+                _ => Err(new InterpretError(
+                    InterpretErrorKind.HostError,
+                    $"Unknown native interpret result: {raw}")),
             };
         }
 

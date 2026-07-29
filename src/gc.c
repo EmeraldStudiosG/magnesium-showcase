@@ -38,6 +38,7 @@ static void push_gray(VM *vm, Obj *obj) {
  * ======================================================================== */
 void gc_mark_object(VM *vm, Obj *object) {
     if (!object) return;
+    if (vm->minor_gc_active && object->is_old) return;
     if (object->is_marked) return;
     object->is_marked = true;
     push_gray(vm, object);
@@ -57,7 +58,30 @@ static void mark_table(VM *vm, Table *table) {
     }
 }
 
+static void table_remove_unmarked_strings(Table *table, bool minor) {
+    for (int i = 0; i < table->capacity; i++) {
+        TableEntry *entry = &table->entries[i];
+        if (entry->key == NULL || entry->key == TOMBSTONE_KEY) continue;
+        Obj *string = (Obj *)entry->key;
+        bool collectable = !minor || (!string->is_old && string->gc_age != 0);
+        if (collectable && !string->is_marked) {
+            table_delete(table, entry->key);
+        }
+    }
+}
+
+static void blacken_object(VM *vm, Obj *object);
+
 static void mark_roots(VM *vm) {
+    for (VMRoot *root = vm->host_roots; root; root = root->next) {
+        gc_mark_value(vm, root->value);
+    }
+    for (NativeArgRoot *root = vm->native_arg_roots; root; root = root->previous) {
+        for (int i = 0; i < root->count; i++) {
+            gc_mark_value(vm, root->values[i]);
+        }
+    }
+
     int top = vm->stack_top > vm->stack_capacity ? vm->stack_capacity : vm->stack_top;
     for (int i = 0; i < top; i++) {
         gc_mark_value(vm, vm->stack[i]);
@@ -107,8 +131,11 @@ static void mark_roots(VM *vm) {
     }
 
     mark_table(vm, &vm->globals);
-    mark_table(vm, &vm->strings);
     mark_table(vm, &vm->modules);
+    for (int i = 0; i < vm->int_str_cache_used_count; i++) {
+        uint32_t index = vm->int_str_cache_used[i];
+        gc_mark_object(vm, (Obj *)vm->int_str_cache[index]);
+    }
 
     for (int i = 0; i < vm->defer_stack.count; i++) {
         gc_mark_object(vm, (Obj *)vm->defer_stack.items[i]);
@@ -124,6 +151,15 @@ static void mark_roots(VM *vm) {
 }
 
 static void mark_roots_minor(VM *vm) {
+    for (VMRoot *root = vm->host_roots; root; root = root->next) {
+        gc_mark_value(vm, root->value);
+    }
+    for (NativeArgRoot *root = vm->native_arg_roots; root; root = root->previous) {
+        for (int i = 0; i < root->count; i++) {
+            gc_mark_value(vm, root->values[i]);
+        }
+    }
+
     int top = vm->stack_top > vm->stack_capacity ? vm->stack_capacity : vm->stack_top;
     for (int i = 0; i < top; i++) {
         gc_mark_value(vm, vm->stack[i]);
@@ -185,17 +221,16 @@ static void mark_roots_minor(VM *vm) {
     }
 
     mark_table(vm, &vm->globals);
-    if (vm->strings_interned_since_minor > 0) {
-        mark_table(vm, &vm->strings);
-    }
     mark_table(vm, &vm->modules);
+    for (int i = 0; i < vm->int_str_cache_used_count; i++) {
+        uint32_t index = vm->int_str_cache_used[i];
+        gc_mark_object(vm, (Obj *)vm->int_str_cache[index]);
+    }
 
     for (int i = 0; i < vm->remembered_count; i++) {
-        gc_mark_object(vm, vm->remembered_set[i]);
+        blacken_object(vm, vm->remembered_set[i]);
     }
 }
-
-static void blacken_object(VM *vm, Obj *object);
 
 static void protect_newborn_young(VM *vm) {
     for (Obj *object = vm->young_objects; object; object = object->next) {
@@ -246,7 +281,11 @@ static void blacken_object(VM *vm, Obj *object) {
         }
 
         case OBJ_NATIVE:
+            gc_mark_object(vm, (Obj *)((ObjNative *)object)->name);
+            break;
+
         case OBJ_FFI:
+            gc_mark_object(vm, (Obj *)((ObjFFI *)object)->name);
             break;
 
         case OBJ_NATIVE_HANDLE: {
@@ -359,8 +398,6 @@ static size_t free_object(VM *vm, Obj *object) {
             break;
         }
         case OBJ_CLOSURE: {
-            ObjClosure *cl = (ObjClosure *)object;
-            freed += cl->upvalue_count * sizeof(ObjUpvalue *);
             break;
         }
         case OBJ_UPVALUE:
@@ -396,22 +433,26 @@ static size_t free_object(VM *vm, Obj *object) {
         }
         case OBJ_STRUCT: {
             ObjStruct *s = (ObjStruct *)object;
+            freed += sizeof(ObjString *) * (size_t)s->field_count;
             free(s->field_names);
             table_free(&s->field_index);
             break;
         }
         case OBJ_INSTANCE: {
-            ObjInstance *inst = (ObjInstance *)object;
-            freed += sizeof(Value) * (size_t)inst->klass->field_count;
             break;
         }
         case OBJ_ERROR:
             break;
-        case OBJ_VM_TASK:
-            vm_task_destroy((ObjVMTask *)object);
+        case OBJ_VM_TASK: {
+            ObjVMTask *task = (ObjVMTask *)object;
+            if (task->path) freed += strlen(task->path) + 1;
+            vm_task_destroy(task);
             break;
+        }
         case OBJ_COROUTINE: {
             ObjCoroutine *co = (ObjCoroutine *)object;
+            freed += sizeof(Value) * (size_t)co->stack_capacity;
+            freed += sizeof(ObjClosure *) * (size_t)co->defer_capacity;
             free(co->stack);
             free(co->defer_items);
             break;
@@ -486,10 +527,20 @@ void remembered_set_add(VM *vm, Obj *old_obj) {
  * Public API: Minor Collection
  * ======================================================================== */
 void gc_minor_collect(VM *vm) {
+    vm->minor_gc_active = true;
+
+    /* Inline caches are weak accelerators. They must never keep stale
+       addresses to young objects across a collection. */
+    memset(vm->global_ic, 0, sizeof(vm->global_ic));
+    memset(vm->field_ic, 0, sizeof(vm->field_ic));
+    memset(vm->method_ic, 0, sizeof(vm->method_ic));
+    memset(vm->dict_ic, 0, sizeof(vm->dict_ic));
+
     protect_newborn_young(vm);
     trace_references(vm);
     mark_roots_minor(vm);
     trace_references(vm);
+    table_remove_unmarked_strings(&vm->strings, true);
 
     Obj *previous = NULL;
     Obj *object = vm->young_objects;
@@ -537,14 +588,17 @@ void gc_minor_collect(VM *vm) {
     }
 
     vm->young_bytes = remaining_young_bytes;
+
     vm->remembered_count = 0;
     vm->strings_interned_since_minor = 0;
+    vm->minor_gc_active = false;
 }
 
 /* ========================================================================
  * Public API: Major Collection
  * ======================================================================== */
 void gc_major_collect(VM *vm) {
+    vm->minor_gc_active = false;
     memset(vm->global_ic, 0, sizeof(vm->global_ic));
     memset(vm->field_ic, 0, sizeof(vm->field_ic));
     memset(vm->method_ic, 0, sizeof(vm->method_ic));
@@ -564,6 +618,7 @@ void gc_major_collect(VM *vm) {
 
     mark_roots(vm);
     trace_references(vm);
+    table_remove_unmarked_strings(&vm->strings, false);
     sweep(vm);
     vm->remembered_count = 0;
     vm->next_gc = vm->bytes_allocated * GC_HEAP_GROW_FACTOR;

@@ -1,185 +1,552 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+set -euo pipefail
 
-# Use environment variable if set, otherwise default to 5
-RUNS=${RUNS:-5}
-BENCH_TIMEOUT=${BENCH_TIMEOUT:-30}
-BENCH_FILTER=${BENCH:-}
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$REPO_ROOT/benchmark"
+
+die() {
+    printf 'Benchmark gate failed: %s\n' "$*" >&2
+    exit 1
+}
+
+read_integer_setting() {
+    local name="$1"
+    local default_value="$2"
+    local minimum="$3"
+    local value="${!name:-$default_value}"
+
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        die "$name must be an integer greater than or equal to $minimum."
+    (( value >= minimum )) ||
+        die "$name must be an integer greater than or equal to $minimum."
+    printf '%s' "$value"
+}
+
+read_bool_setting() {
+    local value="${!1:-${2:-false}}"
+    case "${value,,}" in
+        1|true|yes|on) return 0 ;;
+        0|false|no|off) return 1 ;;
+        *) die "$1 must be a boolean setting (0/1 or false/true)." ;;
+    esac
+}
+
+resolve_executable() {
+    local candidate="$1"
+    if [[ "$candidate" == */* ]]; then
+        [[ -x "$candidate" ]] || return 1
+        printf '%s' "$candidate"
+        return 0
+    fi
+    command -v -- "$candidate" 2>/dev/null
+}
+
+find_runtime() {
+    local override="$1"
+    local version_pattern="$2"
+    shift 2
+    local candidate executable output status
+
+    if [[ -n "$override" ]]; then
+        set -- "$override"
+    fi
+
+    for candidate in "$@"; do
+        executable="$(resolve_executable "$candidate")" || continue
+        if output="$("$executable" "${VERSION_ARGS[@]}" 2>&1)"; then
+            status=0
+        else
+            status=$?
+        fi
+        if (( status == 0 )) &&
+                grep -Eq -- "$version_pattern" <<<"$output"; then
+            FOUND_EXECUTABLE="$executable"
+            FOUND_VERSION="$(tr '\r\n' '  ' <<<"$output" |
+                awk '{$1=$1; print}')"
+            return 0
+        fi
+        if [[ -n "$override" ]]; then
+            die "Runtime override '$override' has unsupported version output: $output"
+        fi
+    done
+    return 1
+}
+
+format_command() {
+    local argument
+    for argument in "$@"; do
+        printf '%q ' "$argument"
+    done
+}
+
+now_nanoseconds() {
+    local value
+    value="$(date +%s%N)"
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        die "This benchmark runner requires a date implementation with %N support."
+    printf '%s' "$value"
+}
+
+run_capture() {
+    local timeout_seconds="$1"
+    shift
+    local start end status
+
+    start="$(now_nanoseconds)"
+    # GNU timeout waits roughly 100 ms after short-lived children on some WSL
+    # releases, which completely distorts small benchmarks. Perl installs the
+    # same process-level alarm and then execs the runtime, so no watchdog
+    # process or polling delay is included in the measurement.
+    if perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' \
+            "$timeout_seconds" "$@" >"$CAPTURE_STDOUT" 2>"$CAPTURE_STDERR"; then
+        status=0
+    else
+        status=$?
+    fi
+    end="$(now_nanoseconds)"
+
+    RUN_STATUS="$status"
+    RUN_SECONDS="$(awk -v start="$start" -v end="$end" \
+        'BEGIN { printf "%.9f", (end - start) / 1000000000 }')"
+}
+
+assert_successful_run() {
+    local label="$1"
+    shift
+
+    if (( RUN_STATUS == 142 || RUN_STATUS == 137 )); then
+        die "$label timed out after ${BENCH_TIMEOUT}s: $(format_command "$@")"
+    fi
+    if (( RUN_STATUS != 0 )); then
+        printf '%s\n' "Command stderr:" >&2
+        sed 's/^/  /' "$CAPTURE_STDERR" >&2
+        die "$label exited with status $RUN_STATUS: $(format_command "$@")"
+    fi
+    if [[ -s "$CAPTURE_STDERR" ]]; then
+        printf '%s\n' "Unexpected command stderr:" >&2
+        sed 's/^/  /' "$CAPTURE_STDERR" >&2
+        die "$label wrote to stderr: $(format_command "$@")"
+    fi
+}
+
+outputs_equal() {
+    local expected_file="$1"
+    local actual_file="$2"
+
+    cmp -s -- "$expected_file" "$actual_file" && return 0
+    awk '
+        function abs(value) {
+            return value < 0 ? -value : value
+        }
+        function numeric(value) {
+            return value ~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/
+        }
+        NR == FNR {
+            sub(/\r$/, "")
+            expected[++expected_count] = $0
+            next
+        }
+        {
+            sub(/\r$/, "")
+            actual[++actual_count] = $0
+        }
+        END {
+            if (expected_count != actual_count) {
+                exit 1
+            }
+            for (line = 1; line <= expected_count; line++) {
+                if (expected[line] == actual[line]) {
+                    continue
+                }
+                expected_parts = split(expected[line], expected_tokens, /[[:space:]]+/)
+                actual_parts = split(actual[line], actual_tokens, /[[:space:]]+/)
+                if (expected_parts != actual_parts) {
+                    exit 1
+                }
+                for (part = 1; part <= expected_parts; part++) {
+                    if (expected_tokens[part] == actual_tokens[part]) {
+                        continue
+                    }
+                    if (!numeric(expected_tokens[part]) ||
+                            !numeric(actual_tokens[part])) {
+                        exit 1
+                    }
+                    # Accept representation differences such as 1, 1.0, and
+                    # 1e0, but require the decoded numbers to be identical.
+                    if ((expected_tokens[part] + 0) != (actual_tokens[part] + 0)) {
+                        exit 1
+                    }
+                }
+            }
+        }
+    ' "$expected_file" "$actual_file"
+}
+
+run_build_step() {
+    local label="$1"
+    shift
+
+    printf '  %-24s ' "$label"
+    format_command "$@"
+    printf '\n'
+    run_capture "$BENCH_TIMEOUT" "$@"
+    if (( RUN_STATUS != 0 )); then
+        sed 's/^/  /' "$CAPTURE_STDERR" >&2
+        die "$label failed with status $RUN_STATUS."
+    fi
+}
+
+validate_command() {
+    local label="$1"
+    local expected_file="$2"
+    shift 2
+
+    printf '  check %-20s ' "$label"
+    format_command "$@"
+    printf '\n'
+    run_capture "$BENCH_TIMEOUT" "$@"
+    assert_successful_run "$label" "$@"
+    if ! outputs_equal "$expected_file" "$CAPTURE_STDOUT"; then
+        printf '%s\n' "Expected output:" >&2
+        sed 's/^/  /' "$expected_file" >&2
+        printf '%s\n' "Actual output:" >&2
+        sed 's/^/  /' "$CAPTURE_STDOUT" >&2
+        die "Output mismatch for $label."
+    fi
+}
+
+measure_command() {
+    local label="$1"
+    local expected_file="$2"
+    shift 2
+    local run_index
+    local -a measurements=()
+
+    for ((run_index = 0; run_index < WARMUPS; run_index++)); do
+        run_capture "$BENCH_TIMEOUT" "$@"
+        assert_successful_run "$label" "$@"
+        outputs_equal "$expected_file" "$CAPTURE_STDOUT" ||
+            die "Output changed during warmup for $label."
+    done
+
+    for ((run_index = 0; run_index < RUNS; run_index++)); do
+        run_capture "$BENCH_TIMEOUT" "$@"
+        assert_successful_run "$label" "$@"
+        outputs_equal "$expected_file" "$CAPTURE_STDOUT" ||
+            die "Output changed during timed run for $label."
+        measurements+=("$RUN_SECONDS")
+    done
+
+    MEASURE_TIMES="$(IFS=', '; printf '%s' "${measurements[*]}")"
+    MEASURE_AVERAGE="$(printf '%s\n' "${measurements[@]}" |
+        awk '{ total += $1 } END { printf "%.6f", total / NR }')"
+    mapfile -t SORTED_MEASUREMENTS < <(
+        printf '%s\n' "${measurements[@]}" | sort -n
+    )
+    local count="${#SORTED_MEASUREMENTS[@]}"
+    local middle=$((count / 2))
+    if (( count % 2 == 1 )); then
+        MEASURE_MEDIAN="$(printf '%.6f' "${SORTED_MEASUREMENTS[$middle]}")"
+    else
+        MEASURE_MEDIAN="$(awk \
+            -v left="${SORTED_MEASUREMENTS[$((middle - 1))]}" \
+            -v right="${SORTED_MEASUREMENTS[$middle]}" \
+            'BEGIN { printf "%.6f", (left + right) / 2 }')"
+    fi
+}
+
+write_result() {
+    local label="$1"
+    local relative
+    relative="$(awk -v runtime="$MEASURE_MEDIAN" \
+        -v magnesium="$MAGNESIUM_MEDIAN" \
+        'BEGIN { printf "%.2f", runtime / magnesium }')"
+    printf '%-23s %10ss %10ss %8sx  %s\n' \
+        "$label" "$MEASURE_AVERAGE" "$MEASURE_MEDIAN" "$relative" \
+        "$MEASURE_TIMES"
+}
+
+check_performance() {
+    local benchmark="$1"
+    local mode="$2"
+    local runtime="$3"
+    local runtime_median="$4"
+    local relative
+
+    if awk -v magnesium="$MAGNESIUM_MEDIAN" -v reference="$runtime_median" \
+            'BEGIN { exit !(magnesium >= reference) }'; then
+        relative="$(awk -v runtime="$runtime_median" \
+            -v magnesium="$MAGNESIUM_MEDIAN" \
+            'BEGIN { printf "%.2f", runtime / magnesium }')"
+        PERFORMANCE_FAILURES+=(
+            "$benchmark ($mode): Magnesium ${MAGNESIUM_MEDIAN}s did not beat $runtime ${runtime_median}s (${relative}x; must be >1.00x)"
+        )
+    fi
+}
+
+RUNS="$(read_integer_setting RUNS 5 1)"
+WARMUPS="$(read_integer_setting WARMUPS 1 0)"
+BENCH_TIMEOUT="$(read_integer_setting BENCH_TIMEOUT 30 1)"
+BENCH_FILTER="${BENCH:-}"
+if read_bool_setting REQUIRE_ALL_RUNTIMES true; then
+    REQUIRE_ALL_RUNTIMES_ENABLED=true
+else
+    REQUIRE_ALL_RUNTIMES_ENABLED=false
+fi
+if read_bool_setting PERFORMANCE_GATE true; then
+    PERFORMANCE_GATE_ENABLED=true
+else
+    PERFORMANCE_GATE_ENABLED=false
+fi
+
 BENCHMARKS=(
-    "fib35"
-    "binary_trees"
-    "sieve"
-    "mandelbrot"
-    "dict_bench"
-    "arith_loop"
-    "call_loop"
-    "closure_loop"
-    "array_loop"
-    "object_fields"
-    "gc_alloc"
-    "string_concat"
-    "control_flow"
-    "fallible_lookup"
-    "native_len"
-    "coroutine_switch"
+    fib35 binary_trees sieve mandelbrot dict_bench arith_loop call_loop
+    closure_loop array_loop object_fields gc_alloc string_concat control_flow
+    fallible_lookup native_len coroutine_switch
 )
 
-if [ -n "$BENCH_FILTER" ]; then
-    FOUND=0
-    FILTERED=()
-    for BENCH_NAME in "${BENCHMARKS[@]}"; do
-        if [ "$BENCH_NAME" = "$BENCH_FILTER" ]; then
-            FILTERED=("$BENCH_NAME")
-            FOUND=1
+if [[ -n "$BENCH_FILTER" ]]; then
+    found=false
+    for benchmark in "${BENCHMARKS[@]}"; do
+        if [[ "$benchmark" == "$BENCH_FILTER" ]]; then
+            found=true
             break
         fi
     done
-    if [ "$FOUND" -eq 0 ]; then
-        echo "Unknown benchmark: $BENCH_FILTER"
-        echo "Available benchmarks: ${BENCHMARKS[*]}"
-        exit 1
-    fi
-    BENCHMARKS=("${FILTERED[@]}")
+    "$found" || die "Unknown benchmark '$BENCH_FILTER'. Available: ${BENCHMARKS[*]}"
+    BENCHMARKS=("$BENCH_FILTER")
 fi
 
-time_command() {
-    local runtime="$1"
-    local cmd="$2"
-    local start end status
+command -v perl >/dev/null ||
+    die "Perl is required for low-overhead benchmark timeouts."
 
-    start=$(date +%s%N)
-    timeout "$BENCH_TIMEOUT" bash -c "$cmd" > /dev/null
-    status=$?
-    end=$(date +%s%N)
+MAGNESIUM_OVERRIDE="${BINARY:-${MAGNESIUM_BIN:-}}"
+if [[ -z "$MAGNESIUM_OVERRIDE" && -x "$REPO_ROOT/magnesium" ]]; then
+    MAGNESIUM_OVERRIDE="$REPO_ROOT/magnesium"
+fi
+VERSION_ARGS=(--version)
+FOUND_EXECUTABLE=
+FOUND_VERSION=
+find_runtime "$MAGNESIUM_OVERRIDE" '^Magnesium v' magnesium ||
+    die "Magnesium was not found. Set BINARY or MAGNESIUM_BIN."
+MAGNESIUM_EXECUTABLE="$FOUND_EXECUTABLE"
+MAGNESIUM_VERSION="$FOUND_VERSION"
 
-    if [ "$status" -ne 0 ]; then
-        if [ "$status" -eq 124 ]; then
-            echo "Benchmark command timed out after ${BENCH_TIMEOUT}s for $runtime: $cmd" >&2
-            return 1
-        fi
-        echo "Benchmark command failed for $runtime: $cmd" >&2
-        return 1
-    fi
+VERSION_ARGS=(-v)
+FOUND_EXECUTABLE=
+FOUND_VERSION=
+if find_runtime "${LUA:-}" 'Lua 5[.]4' lua5.4 lua54 lua; then
+    HAVE_LUA=true
+    LUA_EXECUTABLE="$FOUND_EXECUTABLE"
+    LUA_VERSION="$FOUND_VERSION"
+else
+    HAVE_LUA=false
+fi
 
-    awk -v start="$start" -v end="$end" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }'
+FOUND_EXECUTABLE=
+FOUND_VERSION=
+if find_runtime "${LUAC:-}" 'Lua 5[.]4' luac5.4 luac54 luac; then
+    HAVE_LUAC=true
+    LUAC_EXECUTABLE="$FOUND_EXECUTABLE"
+    LUAC_VERSION="$FOUND_VERSION"
+else
+    HAVE_LUAC=false
+fi
+
+VERSION_ARGS=(--version)
+FOUND_EXECUTABLE=
+FOUND_VERSION=
+if find_runtime "${PYTHON:-}" '^Python 3[.]' python3 python; then
+    HAVE_PYTHON=true
+    PYTHON_EXECUTABLE="$FOUND_EXECUTABLE"
+    PYTHON_VERSION="$FOUND_VERSION"
+else
+    HAVE_PYTHON=false
+fi
+
+printf '%s\n' "=== Benchmark release gate ==="
+printf 'Runs: %s; warmups: %s; timeout: %ss\n' \
+    "$RUNS" "$WARMUPS" "$BENCH_TIMEOUT"
+printf 'Performance gate: %s; require all runtimes: %s\n' \
+    "$PERFORMANCE_GATE_ENABLED" "$REQUIRE_ALL_RUNTIMES_ENABLED"
+printf 'Magnesium: %s (%s)\n' "$MAGNESIUM_EXECUTABLE" "$MAGNESIUM_VERSION"
+if "$HAVE_LUA"; then
+    printf 'Lua:       %s (%s)\n' "$LUA_EXECUTABLE" "$LUA_VERSION"
+else
+    printf '%s\n' "Lua:       unavailable (requires Lua 5.4; set LUA)"
+fi
+if "$HAVE_LUAC"; then
+    printf 'Lua bytecode compiler: %s (%s)\n' \
+        "$LUAC_EXECUTABLE" "$LUAC_VERSION"
+else
+    printf '%s\n' "Lua bytecode compiler: unavailable (set LUAC)"
+fi
+if "$HAVE_PYTHON"; then
+    printf 'Python:    %s (%s)\n' "$PYTHON_EXECUTABLE" "$PYTHON_VERSION"
+else
+    printf '%s\n' "Python:    unavailable (requires Python 3; set PYTHON)"
+fi
+
+if "$REQUIRE_ALL_RUNTIMES_ENABLED" &&
+        { ! "$HAVE_LUA" || ! "$HAVE_LUAC" || ! "$HAVE_PYTHON"; }; then
+    die "REQUIRE_ALL_RUNTIMES is enabled, but Lua 5.4, luac 5.4, and Python 3 are not all available."
+fi
+
+ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/magnesium-bench.XXXXXX")"
+CAPTURE_STDOUT="$ARTIFACT_DIR/capture.stdout"
+CAPTURE_STDERR="$ARTIFACT_DIR/capture.stderr"
+BENCHMARK_MAGNESIUM="$ARTIFACT_DIR/magnesium"
+cp -- "$MAGNESIUM_EXECUTABLE" "$BENCHMARK_MAGNESIUM"
+chmod 755 "$BENCHMARK_MAGNESIUM"
+
+cleanup() {
+    case "$ARTIFACT_DIR" in
+        "${TMPDIR:-/tmp}"/magnesium-bench.*)
+            rm -rf -- "$ARTIFACT_DIR"
+            ;;
+        *)
+            printf 'Refusing to remove unexpected artifact path: %s\n' \
+                "$ARTIFACT_DIR" >&2
+            ;;
+    esac
 }
+trap cleanup EXIT
 
-echo "=== Phase 0: Cleanup (Generated Bytecode) ==="
-for BENCH in "${BENCHMARKS[@]}"; do
-    rm -f "$BENCH_DIR/$BENCH.mgc" \
-          "$BENCH_DIR/$BENCH.luac" \
-          "$BENCH_DIR/$BENCH.luajit"
+printf '\n%s\n' "=== Preparation ==="
+for benchmark in "${BENCHMARKS[@]}"; do
+    printf '%s\n' "$benchmark"
+    mg_source="$BENCH_DIR/$benchmark.mg"
+    lua_source="$BENCH_DIR/$benchmark.lua"
+    python_source="$BENCH_DIR/$benchmark.py"
+    [[ -f "$mg_source" ]] || die "Missing benchmark source: $mg_source"
+    [[ -f "$lua_source" ]] || die "Missing benchmark source: $lua_source"
+    [[ -f "$python_source" ]] || die "Missing benchmark source: $python_source"
+
+    cp -- "$mg_source" "$ARTIFACT_DIR/$benchmark.mg"
+    cp -- "$lua_source" "$ARTIFACT_DIR/$benchmark.lua"
+    cp -- "$python_source" "$ARTIFACT_DIR/$benchmark.py"
+    run_build_step "Magnesium bytecode" "$BENCHMARK_MAGNESIUM" \
+        build "$ARTIFACT_DIR/$benchmark.mg"
+    [[ -f "$ARTIFACT_DIR/$benchmark.mgc" ]] ||
+        die "Magnesium build did not create $ARTIFACT_DIR/$benchmark.mgc"
+
+    if "$HAVE_LUA" && "$HAVE_LUAC"; then
+        run_build_step "Lua bytecode" "$LUAC_EXECUTABLE" \
+            -o "$ARTIFACT_DIR/$benchmark.luac" \
+            "$ARTIFACT_DIR/$benchmark.lua"
+    fi
+    if "$HAVE_PYTHON"; then
+        python_compile_code='import py_compile,sys;py_compile.compile(sys.argv[1],cfile=sys.argv[2],doraise=True)'
+        run_build_step "Python bytecode" "$PYTHON_EXECUTABLE" \
+            -c "$python_compile_code" "$ARTIFACT_DIR/$benchmark.py" \
+            "$ARTIFACT_DIR/$benchmark.pyc"
+    fi
 done
-if [ -d "$BENCH_DIR/__pycache__" ]; then
-    for BENCH in "${BENCHMARKS[@]}"; do
-        rm -f "$BENCH_DIR/__pycache__/$BENCH".cpython-*.pyc
+
+printf '\n%s\n' "=== Correctness preflight ==="
+for benchmark in "${BENCHMARKS[@]}"; do
+    printf '%s\n' "$benchmark"
+    expected_file="$ARTIFACT_DIR/$benchmark.expected"
+
+    printf '  baseline %-17s ' "Magnesium"
+    format_command "$BENCHMARK_MAGNESIUM" "$ARTIFACT_DIR/$benchmark.mg"
+    printf '\n'
+    run_capture "$BENCH_TIMEOUT" "$BENCHMARK_MAGNESIUM" \
+        "$ARTIFACT_DIR/$benchmark.mg"
+    assert_successful_run "Magnesium" "$BENCHMARK_MAGNESIUM" \
+        "$ARTIFACT_DIR/$benchmark.mg"
+    cp -- "$CAPTURE_STDOUT" "$expected_file"
+
+    validate_command "Magnesium" "$expected_file" "$BENCHMARK_MAGNESIUM" \
+        "$ARTIFACT_DIR/$benchmark.mg"
+    if "$HAVE_LUA"; then
+        validate_command "Lua 5.4" "$expected_file" "$LUA_EXECUTABLE" \
+            "$ARTIFACT_DIR/$benchmark.lua"
+    fi
+    if "$HAVE_PYTHON"; then
+        validate_command "Python 3" "$expected_file" "$PYTHON_EXECUTABLE" \
+            "$ARTIFACT_DIR/$benchmark.py"
+    fi
+
+    validate_command "Magnesium (MGC)" "$expected_file" \
+        "$BENCHMARK_MAGNESIUM" "$ARTIFACT_DIR/$benchmark.mgc"
+    if "$HAVE_LUA" && "$HAVE_LUAC"; then
+        validate_command "Lua 5.4 (LUAC)" "$expected_file" \
+            "$LUA_EXECUTABLE" "$ARTIFACT_DIR/$benchmark.luac"
+    fi
+    if "$HAVE_PYTHON"; then
+        validate_command "Python 3 (PYC)" "$expected_file" \
+            "$PYTHON_EXECUTABLE" "$ARTIFACT_DIR/$benchmark.pyc"
+    fi
+done
+
+printf '\n%s\n' "=== Timed benchmarks ==="
+PERFORMANCE_FAILURES=()
+for benchmark in "${BENCHMARKS[@]}"; do
+    printf '\n%s\n%s\n' "--------------------------------------------------------" "$benchmark"
+    expected_file="$ARTIFACT_DIR/$benchmark.expected"
+
+    printf '\n%s - source mode\n' "$benchmark"
+    printf '%-23s %11s %11s %9s  %s\n' \
+        "Runtime" "Average" "Median" "vs Mg" "Runs"
+    measure_command "Magnesium" "$expected_file" "$BENCHMARK_MAGNESIUM" \
+        "$ARTIFACT_DIR/$benchmark.mg"
+    MAGNESIUM_MEDIAN="$MEASURE_MEDIAN"
+    write_result "Magnesium"
+    if "$HAVE_LUA"; then
+        measure_command "Lua 5.4" "$expected_file" "$LUA_EXECUTABLE" \
+            "$ARTIFACT_DIR/$benchmark.lua"
+        write_result "Lua 5.4"
+        if "$PERFORMANCE_GATE_ENABLED"; then
+            check_performance "$benchmark" "source" "Lua 5.4" \
+                "$MEASURE_MEDIAN"
+        fi
+    fi
+    if "$HAVE_PYTHON"; then
+        measure_command "Python 3" "$expected_file" "$PYTHON_EXECUTABLE" \
+            "$ARTIFACT_DIR/$benchmark.py"
+        write_result "Python 3"
+        if "$PERFORMANCE_GATE_ENABLED"; then
+            check_performance "$benchmark" "source" "Python 3" \
+                "$MEASURE_MEDIAN"
+        fi
+    fi
+
+    printf '\n%s - bytecode mode\n' "$benchmark"
+    printf '%-23s %11s %11s %9s  %s\n' \
+        "Runtime" "Average" "Median" "vs Mg" "Runs"
+    measure_command "Magnesium (MGC)" "$expected_file" \
+        "$BENCHMARK_MAGNESIUM" "$ARTIFACT_DIR/$benchmark.mgc"
+    MAGNESIUM_MEDIAN="$MEASURE_MEDIAN"
+    write_result "Magnesium (MGC)"
+    if "$HAVE_LUA" && "$HAVE_LUAC"; then
+        measure_command "Lua 5.4 (LUAC)" "$expected_file" \
+            "$LUA_EXECUTABLE" "$ARTIFACT_DIR/$benchmark.luac"
+        write_result "Lua 5.4 (LUAC)"
+        if "$PERFORMANCE_GATE_ENABLED"; then
+            check_performance "$benchmark" "bytecode" "Lua 5.4 (LUAC)" \
+                "$MEASURE_MEDIAN"
+        fi
+    fi
+    if "$HAVE_PYTHON"; then
+        measure_command "Python 3 (PYC)" "$expected_file" \
+            "$PYTHON_EXECUTABLE" "$ARTIFACT_DIR/$benchmark.pyc"
+        write_result "Python 3 (PYC)"
+        if "$PERFORMANCE_GATE_ENABLED"; then
+            check_performance "$benchmark" "bytecode" "Python 3 (PYC)" \
+                "$MEASURE_MEDIAN"
+        fi
+    fi
+done
+
+if "$PERFORMANCE_GATE_ENABLED" &&
+        ((${#PERFORMANCE_FAILURES[@]} > 0)); then
+    printf '\n%s\n' "=== Performance gate failures ===" >&2
+    for failure in "${PERFORMANCE_FAILURES[@]}"; do
+        printf '  - %s\n' "$failure" >&2
     done
+    die "${#PERFORMANCE_FAILURES[@]} runtime comparisons failed."
 fi
-echo "Done."
-echo ""
 
-echo "=== Phase 1: Preparation (Full Compilation) ==="
-for BENCH in "${BENCHMARKS[@]}"; do
-    printf "Building %-15s ... " "$BENCH (all languages)"
-    # Magnesium
-    $REPO_ROOT/magnesium build $BENCH_DIR/$BENCH.mg > /dev/null || {
-        echo "Magnesium build failed."
-        exit 1
-    }
-    # Lua 5.4
-    luac -o $BENCH_DIR/$BENCH.luac $BENCH_DIR/$BENCH.lua || {
-        echo "Lua build failed."
-        exit 1
-    }
-    # LuaJIT
-    luajit -b $BENCH_DIR/$BENCH.lua $BENCH_DIR/$BENCH.luajit || {
-        echo "LuaJIT build failed."
-        exit 1
-    }
-    # Python 3
-    python3 -m py_compile $BENCH_DIR/$BENCH.py || {
-        echo "Python compile failed."
-        exit 1
-    }
-    echo "Done."
-done
-echo ""
-
-echo "=== Phase 2: Benchmarking ==="
-
-for BENCH in "${BENCHMARKS[@]}"; do
-    echo "--------------------------------------------------------"
-    echo "Benchmarking: $BENCH"
-    echo ""
-
-    # Interpreted / Source Mode
-    declare -A INTERP_RUNTIMES=(
-        ["Magnesium"]="$REPO_ROOT/magnesium $BENCH_DIR/$BENCH.mg"
-        ["Lua 5.4"]="lua $BENCH_DIR/$BENCH.lua"
-        ["LuaJIT"]="luajit $BENCH_DIR/$BENCH.lua"
-        ["Python 3"]="python3 $BENCH_DIR/$BENCH.py"
-    )
-    INTERP_ORDER=("Magnesium" "Lua 5.4" "LuaJIT" "Python 3")
-
-    # Bytecode / Compiled Mode
-    PY_CACHED=$(find $BENCH_DIR/__pycache__ -name "${BENCH}.cpython-*.pyc" | head -n 1)
-    
-    declare -A BYTE_RUNTIMES=(
-        ["Magnesium (MGC)"]="$REPO_ROOT/magnesium $BENCH_DIR/$BENCH.mgc"
-        ["Lua 5.4 (LUAC)"]="lua $BENCH_DIR/$BENCH.luac"
-        ["LuaJIT (Byte)"]="luajit $BENCH_DIR/$BENCH.luajit"
-        ["Python 3 (PYC)"]="python3 $PY_CACHED"
-    )
-    BYTE_ORDER=("Magnesium (MGC)" "Lua 5.4 (LUAC)" "LuaJIT (Byte)" "Python 3 (PYC)")
-
-    # 1. Run Interpreted
-    echo "### $BENCH - Interpreted / Source Mode ($RUNS runs)"
-    printf "| %-16s |" "Runtime"
-    for i in $(seq 1 $RUNS); do printf " Run %d |" $i; done
-    printf " **Avg** |\n"
-    SEP="|------------------|"
-    for i in $(seq 1 $RUNS); do SEP="${SEP}-------|"; done
-    SEP="${SEP}----------|"
-    echo "$SEP"
-
-    for RUNTIME in "${INTERP_ORDER[@]}"; do
-        CMD="${INTERP_RUNTIMES[$RUNTIME]}"
-        TOTAL=0
-        TIMES=""
-        for i in $(seq 1 $RUNS); do
-            T=$(time_command "$RUNTIME" "$CMD") || exit 1
-            TIMES="$TIMES $T"
-            TOTAL=$(awk -v t=$TOTAL -v s=$T 'BEGIN {print t + s}')
-        done
-        AVG=$(awk -v t=$TOTAL -v r=$RUNS 'BEGIN {if (r>0) printf "%.6f", t / r; else print "0.000000"}')
-        printf "| %-16s |" "$RUNTIME"
-        for TIME_SEC in $TIMES; do printf " %.6fs |" "$TIME_SEC"; done
-        printf " **%ss** |\n" "$AVG"
-    done
-    echo ""
-
-    # 2. Run Compiled
-    echo "### $BENCH - Compiled / Bytecode Mode ($RUNS runs)"
-    printf "| %-16s |" "Runtime"
-    for i in $(seq 1 $RUNS); do printf " Run %d |" $i; done
-    printf " **Avg** |\n"
-    echo "$SEP"
-
-    for RUNTIME in "${BYTE_ORDER[@]}"; do
-        CMD="${BYTE_RUNTIMES[$RUNTIME]}"
-        TOTAL=0
-        TIMES=""
-        for i in $(seq 1 $RUNS); do
-            T=$(time_command "$RUNTIME" "$CMD") || exit 1
-            TIMES="$TIMES $T"
-            TOTAL=$(awk -v t=$TOTAL -v s=$T 'BEGIN {print t + s}')
-        done
-        AVG=$(awk -v t=$TOTAL -v r=$RUNS 'BEGIN {if (r>0) printf "%.6f", t / r; else print "0.000000"}')
-        printf "| %-16s |" "$RUNTIME"
-        for TIME_SEC in $TIMES; do printf " %.6fs |" "$TIME_SEC"; done
-        printf " **%ss** |\n" "$AVG"
-    done
-    echo ""
-done
+printf '\n%s\n' "Benchmark release gate passed."

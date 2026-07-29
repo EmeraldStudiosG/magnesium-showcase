@@ -1,6 +1,7 @@
 #pragma once
 
-#include <mg/value.hpp>
+#include <mg/string.hpp>
+#include <mg/vm.hpp>
 #include <optional>
 
 namespace mg {
@@ -21,13 +22,15 @@ public:
         return Value::from_raw(raw->items[index]);
     }
 
-    bool set(int32_t index, Value v) {
+    bool set(Vm& vm, int32_t index, Value v) {
         if (!raw || index < 0 || index >= raw->count) return false;
-        raw->items[index] = v.to_raw();
+        array_set(vm.raw_mut(), raw, index, v.to_raw());
         return true;
     }
 
-    void push(Vm& vm, Value v);
+    void push(Vm& vm, Value v) {
+        if (raw) array_push(vm.raw_mut(), raw, v.to_raw());
+    }
 };
 
 class MgDict {
@@ -51,7 +54,8 @@ public:
 
     bool set(Vm& vm, const MgString& key, Value v) {
         if (!raw || !key.raw) return false;
-        return dict_set(reinterpret_cast<::VM*>(&vm), raw, key.raw, v.to_raw());
+        dict_set(vm.raw_mut(), raw, key.raw, v.to_raw());
+        return true;
     }
 
     bool del(const MgString& key) {

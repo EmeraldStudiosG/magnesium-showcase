@@ -1,33 +1,45 @@
 use magnesium_sys as sys;
+use std::ffi::CString;
+use std::rc::Rc;
 
 pub struct Scanner {
     raw: sys::Scanner,
+    // The C scanner stores pointers into this allocation.
+    source: Rc<CString>,
 }
 
 impl Scanner {
-    pub fn new(source: &str) -> Self {
-        let c_source = std::ffi::CString::new(source).expect("source contains null byte");
+    pub fn new(source: &str) -> Result<Self, std::ffi::NulError> {
+        let source = Rc::new(CString::new(source)?);
         let mut scanner: sys::Scanner = unsafe { std::mem::zeroed() };
-        unsafe { sys::scanner_init(&mut scanner, c_source.as_ptr()) };
-        Scanner { raw: scanner }
+        unsafe { sys::scanner_init(&mut scanner, source.as_ptr()) };
+        Ok(Scanner {
+            raw: scanner,
+            source,
+        })
     }
 
     pub fn scan_token(&mut self) -> Token {
         let raw = unsafe { sys::scan_token(&mut self.raw) };
-        Token { raw }
+        Token {
+            raw,
+            _source: Rc::clone(&self.source),
+        }
     }
 
     pub fn raw(&self) -> &sys::Scanner {
         &self.raw
     }
 
-    pub fn raw_mut(&mut self) -> &mut sys::Scanner {
+    pub unsafe fn raw_mut(&mut self) -> &mut sys::Scanner {
         &mut self.raw
     }
 }
 
 pub struct Token {
     raw: sys::Token,
+    // Tokens may outlive their scanner, so retain the source allocation.
+    _source: Rc<CString>,
 }
 
 impl Token {
@@ -43,14 +55,15 @@ impl Token {
         self.raw.line
     }
 
-    pub fn text(&self) -> &str {
+    pub fn text(&self) -> Result<&str, std::str::Utf8Error> {
         if self.raw.start.is_null() || self.raw.length == 0 {
-            return "";
+            return Ok("");
         }
+        debug_assert!(self.raw.length >= 0);
         unsafe {
             let slice =
                 std::slice::from_raw_parts(self.raw.start as *const u8, self.raw.length as usize);
-            std::str::from_utf8_unchecked(slice)
+            std::str::from_utf8(slice)
         }
     }
 }

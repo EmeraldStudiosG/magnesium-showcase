@@ -62,6 +62,37 @@ class Program
         Run("new_dict_value", () => { using var vm = new Vm(); Assert(vm.NewDictValue().IsDict); });
         Run("clear_error", () => { using var vm = new Vm(); vm.Interpret("let x = \"a\" + 1"); vm.ClearError(); });
         Run("runtime_error_message", () => { using var vm = new Vm(); vm.Interpret("let x = \"a\" + 1"); Assert(vm.LastErrorLine > 0); });
+        Run("interpret_error_message_snapshot", () => {
+            using var vm = new Vm();
+            var result = vm.Interpret("let interpret_failure = \"a\" + 1");
+            Assert(result.IsErr);
+            Assert(result.Error?.Kind == InterpretErrorKind.RuntimeError);
+            string snapshot = result.Error?.RuntimeErrorMessage ?? "";
+            Assert(snapshot.Length > 0);
+            Assert(vm.Interpret("let interpret_recovery = 1").IsOk);
+            Assert(result.Error?.RuntimeErrorMessage == snapshot);
+        });
+        Run("interpret_named_error_message_snapshot", () => {
+            using var vm = new Vm();
+            var result = vm.InterpretNamed(
+                "let named_failure = \"a\" + 1", "named_snapshot");
+            Assert(result.IsErr);
+            string snapshot = result.Error?.RuntimeErrorMessage ?? "";
+            Assert(snapshot.Length > 0);
+            vm.ClearError();
+            Assert(result.Error?.RuntimeErrorMessage == snapshot);
+        });
+        Run("run_function_error_message_snapshot", () => {
+            using var vm = new Vm();
+            var function = vm.Compile("let function_failure = \"a\" + 1");
+            Assert(function != null);
+            var result = vm.RunFunction(function.Value);
+            Assert(result.IsErr);
+            string snapshot = result.Error?.RuntimeErrorMessage ?? "";
+            Assert(snapshot.Length > 0);
+            Assert(vm.Interpret("let function_recovery = 1").IsOk);
+            Assert(result.Error?.RuntimeErrorMessage == snapshot);
+        });
         Run("vm_introspection_frame_count", () => {
             using var vm = new Vm();
             Assert(vm.FrameCount == 0);
@@ -82,6 +113,44 @@ class Program
             Assert(v.Value.IsString);
             Assert(v.Value.TryAsString() == "hello world");
         });
+        Run("value_string_utf8_roundtrip", () => {
+            using var vm = new Vm();
+            const string expected = "\u0130stanbul \U0001F9EA";
+            vm.SetGlobalString("\u015Fehir", expected);
+            var v = vm.GetGlobal("\u015Fehir");
+            Assert(v != null && v.Value.TryAsString() == expected);
+        });
+        Run("value_empty_string_roundtrip", () => {
+            using var vm = new Vm();
+            vm.SetGlobalString("empty", "");
+            var v = vm.GetGlobal("empty");
+            Assert(v != null && v.Value.TryAsString() == "");
+        });
+        Run("value_string_rejects_nul", () => {
+            using var vm = new Vm();
+            vm.SetGlobalString("bad", "a\0b");
+            Assert(vm.GetGlobal("bad") == null);
+        });
+        Run("value_rope_string_roundtrip", () => {
+            using var vm = new Vm();
+            Assert(vm.Interpret("let @joined = \"hello \" + \"world\"").IsOk);
+            var joined = vm.GetGlobal("joined");
+            Assert(joined != null, "joined global is missing");
+            string resolved = joined.Value.TryAsString(vm) ?? "<null>";
+            Assert(resolved == "hello world",
+                $"expected resolved rope, got {resolved}");
+        });
+        Run("gc_roots_are_not_lifo", () => {
+            using var vm = new Vm();
+            var first = vm.Root(vm.NewArrayValue());
+            using var second = vm.Root(vm.NewArrayValue());
+            first.Dispose();
+            vm.CollectGarbage();
+            Assert(second.Value.IsArray);
+            second.Value = vm.NewDictValue();
+            vm.CollectGarbage();
+            Assert(second.Value.IsDict);
+        });
 
         // Native tests
         Run("register_native_fn", () => {
@@ -99,7 +168,7 @@ class Program
         Run("native_context_string_arg", () => {
             using var vm = new Vm();
             vm.RegisterNativeFn("is_hello", 1, ctx => Value.BoolVal(ctx.ArgString(0) == "hello"));
-            Assert(vm.Interpret("let ok = is_hello(\"hello\")\nprint(ok)").IsOk);
+            Assert(vm.Interpret("let ok = is_hello(\"hel\" + \"lo\")\nprint(ok)").IsOk);
         });
 
         Run("native_fn_bool_arg", () => {
@@ -132,6 +201,31 @@ class Program
             vm.SetGlobal("x", Value.IntVal(77));
             Assert(vm.Interpret("let y = get_global_x()\nprint(y)").IsOk);
         });
+        Run("native_delegate_survives_gc", () => {
+            using var vm = new Vm();
+            Native.NativeFnDelegate callback = (_, _, _) => Value.IntVal(42).ToRaw();
+            vm.RegisterNative("answer_after_gc", callback, 0);
+            callback = null!;
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert(vm.Interpret("let answer = answer_after_gc()\nprint(answer)").IsOk);
+        });
+        Run("native_closure_survives_gc", () => {
+            using var vm = new Vm();
+            vm.RegisterNativeFn("closure_after_gc", 0, _ => Value.IntVal(7));
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            Assert(vm.Interpret("let answer = closure_after_gc()\nprint(answer)").IsOk);
+        });
+        Run("native_exception_is_contained", () => {
+            using var vm = new Vm();
+            vm.RegisterNativeFn("managed_failure", 0,
+                _ => throw new InvalidOperationException("expected managed failure"));
+            vm.Interpret("managed_failure()");
+            Assert(vm.LastErrorMessage.Contains("expected managed failure"));
+        });
 
         Run("native_handle_basic", () => {
             using var vm = new Vm();
@@ -143,6 +237,14 @@ class Program
             var data = vm.GetGlobal("counter");
             Assert(data != null);
             Assert(data.Value.IsNativeHandle);
+        });
+        Run("disposed_vm_throws", () => {
+            var vm = new Vm();
+            vm.Dispose();
+            bool threw = false;
+            try { vm.Interpret("print(1)"); }
+            catch (ObjectDisposedException) { threw = true; }
+            Assert(threw);
         });
 
         Console.WriteLine();
