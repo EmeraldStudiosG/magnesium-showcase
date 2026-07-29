@@ -20,13 +20,13 @@ The fastest way to install Magnesium and the VS Code extension:
 **Linux/macOS:**
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/EmeraldStudiosG/magnesium-dev/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/EmeraldStudiosG/magnesium-showcase/main/install.sh)
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/EmeraldStudiosG/magnesium-dev/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/EmeraldStudiosG/magnesium-showcase/main/install.ps1 | iex
 ```
 
 This installs the interpreter, shared library, C header, the `mt` toolchain manager, and the VS Code extension (if VS Code and npm are present).
@@ -36,8 +36,8 @@ This installs the interpreter, shared library, C header, the `mt` toolchain mana
 Clone the repository, enter it, and build:
 
 ```bash
-git clone https://github.com/EmeraldStudiosG/magnesium-dev.git
-cd magnesium-dev
+git clone https://github.com/EmeraldStudiosG/magnesium-showcase.git
+cd magnesium-showcase
 make
 ```
 

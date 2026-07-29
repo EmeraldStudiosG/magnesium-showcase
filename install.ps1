@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$RepoUrl = "https://github.com/EmeraldStudiosG/magnesium-dev.git"
+$RepoUrl = "https://github.com/EmeraldStudiosG/magnesium-showcase.git"
 $InstallDir = if ($env:MAGNESIUM_DIR) { $env:MAGNESIUM_DIR } else { "$env:USERPROFILE\.magnesium" }
 $BinDir = if ($env:MAGNESIUM_BIN_DIR) { $env:MAGNESIUM_BIN_DIR } else { "$env:USERPROFILE\.local\bin" }
 $Branch = if ($env:MAGNESIUM_BRANCH) { $env:MAGNESIUM_BRANCH } else { "main" }

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 - 2026-07-30
+
+### Repository links
+
+- Replaced the old repository name `magnesium-dev` with the new name `magnesium-showcase` in `install.sh`, `install.ps1`, build instructions, the `mt` toolchain manager, documentation links, and Visual Studio Code extension links.
+
 ## v1.1.0 - 2026-07-29
 
 ### Compatibility

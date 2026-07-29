@@ -4,7 +4,7 @@
 
 Magnesium is an embeddable scripting language implemented from scratch in C11: lexer, recursive-descent parser, register-bytecode compiler, type checker, generational garbage collector, computed-goto VM, bytecode serializer with a static verifier, language server, VS Code extension, and safe bindings for Rust, C++, and C#. Roughly **17,000 lines of C** with no runtime dependencies beyond libc, libm, and pthreads.
 
-It is at **v1.1.0**, ships with a 59-program exact-output regression suite plus generated CLI edge cases, a strict 16-benchmark cross-language gate (Magnesium vs. Lua 5.4 and CPython), a 10-variant bytecode-loader fuzzer, and an end-to-end LSP smoke test covering every advertised capability.
+It is at **v1.1.1**, ships with a 59-program exact-output regression suite plus generated CLI edge cases, a strict 16-benchmark cross-language gate (Magnesium vs. Lua 5.4 and CPython), a 10-variant bytecode-loader fuzzer, and an end-to-end LSP smoke test covering every advertised capability.
 
 The design goal is **predictable performance without a JIT**: aggressive static bytecode specialization, typed inline caches, a generational collector, and a verifier that makes loading untrusted `.mgc` files safe. Lua is the embedding reference point, but Magnesium keeps arrays, dicts, structs, and enums as distinct types instead of one public table.
 
@@ -94,8 +94,8 @@ if err then print(err) end
 Requires `git`, `make`, and a C compiler: `gcc` or `clang` on Linux/macOS, **LLVM-MinGW (clang)** on Windows (MSVC is not supported; the dispatch loop uses labels-as-values).
 
 ```bash
-git clone https://github.com/EmeraldStudiosG/magnesium-dev.git
-cd magnesium-dev
+git clone https://github.com/EmeraldStudiosG/magnesium-showcase.git
+cd magnesium-showcase
 make                       # builds `magnesium` and `mt`
 magnesium --version
 ```
@@ -209,7 +209,7 @@ The **benchmark suite** covers both source and bytecode modes across Magnesium, 
 
 ## Status
 
-Magnesium is at v1.1.0 and actively maintained. The docs describe the current implementation unless a section explicitly states it is a design note. See [`docs/src/CHANGELOG.md`](docs/src/CHANGELOG.md) for release notes.
+Magnesium is at v1.1.1 and actively maintained. The docs describe the current implementation unless a section explicitly states it is a design note. See [`docs/src/CHANGELOG.md`](docs/src/CHANGELOG.md) for release notes.
 
 ## Contributors
 

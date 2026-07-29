@@ -30,8 +30,8 @@
 #include <sys/wait.h>
 #endif
 
-#define MT_VERSION "1.1.0"
-#define REPO_URL "https://github.com/EmeraldStudiosG/magnesium-dev.git"
+#define MT_VERSION "1.1.1"
+#define REPO_URL "https://github.com/EmeraldStudiosG/magnesium-showcase.git"
 #define DEFAULT_BRANCH "main"
 
 static char *g_prefix = NULL;

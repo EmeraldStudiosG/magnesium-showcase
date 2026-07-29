@@ -11,7 +11,7 @@ build-dir = "book"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 smart-punctuation = true
-git-repository-url = "https://github.com/EmeraldStudiosG/magnesium-dev"
+git-repository-url = "https://github.com/EmeraldStudiosG/magnesium-showcase"
 additional-css = ["src/magnesium.css"]
 additional-js = ["src/flow.js"]
 

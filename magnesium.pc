@@ -4,6 +4,6 @@ includedir=${prefix}/include
 
 Name: magnesium
 Description: Magnesium language VM
-Version: 1.1.0
+Version: 1.1.1
 Libs: -L${libdir} -lmagnesium -lm -ldl -pthread
 Cflags: -I${includedir}

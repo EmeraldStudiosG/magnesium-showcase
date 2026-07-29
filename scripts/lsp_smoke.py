@@ -97,7 +97,7 @@ def main():
     try:
         init = request(proc, counter, "initialize", {"processId": None, "rootUri": str(ROOT)})
         caps = init["result"]["capabilities"]
-        assert init["result"]["serverInfo"]["version"] == "1.1.0"
+        assert init["result"]["serverInfo"]["version"] == "1.1.1"
         assert "completionProvider" in caps
         assert caps.get("hoverProvider") is True
         assert caps.get("documentSymbolProvider") is True

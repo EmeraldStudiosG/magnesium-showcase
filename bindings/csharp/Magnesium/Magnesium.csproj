@@ -4,7 +4,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Magnesium</RootNamespace>
     <AssemblyName>Magnesium</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 </Project>

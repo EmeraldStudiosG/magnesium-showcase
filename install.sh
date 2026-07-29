@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="https://github.com/EmeraldStudiosG/magnesium-dev.git"
+REPO_URL="https://github.com/EmeraldStudiosG/magnesium-showcase.git"
 BRANCH="${MAGNESIUM_BRANCH:-main}"
 PREFIX="${MAGNESIUM_PREFIX:-$HOME/.magnesium}"
 

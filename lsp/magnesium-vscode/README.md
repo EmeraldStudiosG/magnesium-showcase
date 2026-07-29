@@ -1,6 +1,6 @@
 # Magnesium Language Server
 
-Language server extension for [Visual Studio Code](https://code.visualstudio.com/) providing rich editing support for the [Magnesium](https://github.com/EmeraldStudiosG/magnesium-dev) programming language.
+Language server extension for [Visual Studio Code](https://code.visualstudio.com/) providing rich editing support for the [Magnesium](https://github.com/EmeraldStudiosG/magnesium-showcase) programming language.
 
 ## Features
 
@@ -24,7 +24,7 @@ mt install extension
 
 ### Manual
 
-1. Download the latest `.vsix` from [releases](https://github.com/EmeraldStudiosG/magnesium-dev/releases)
+1. Download the latest `.vsix` from [releases](https://github.com/EmeraldStudiosG/magnesium-showcase/releases)
 2. Run `code --install-extension magnesium-vscode-3.6.0.vsix`
 
 ## Configuration

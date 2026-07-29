@@ -2,7 +2,7 @@ use libc::c_int;
 
 pub const MG_VERSION_MAJOR: c_int = 1;
 pub const MG_VERSION_MINOR: c_int = 1;
-pub const MG_VERSION_PATCH: c_int = 0;
+pub const MG_VERSION_PATCH: c_int = 1;
 
 pub const MAX_REGISTERS: c_int = 256;
 pub const MAX_CONSTANTS: c_int = 65536;

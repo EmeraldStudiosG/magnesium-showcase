@@ -2081,7 +2081,7 @@ static void handle_initialize(int id) {
         "\"keyword\",\"variable\",\"function\",\"module\",\"property\",\"struct\",\"enum\","
         "\"string\",\"number\",\"null\",\"comment\",\"operator\"],\"tokenModifiers\":[]},"
         "\"full\":true}"
-        "},\"serverInfo\":{\"name\":\"Magnesium Language Server\",\"version\":\"1.1.0\"}}}", id);
+        "},\"serverInfo\":{\"name\":\"Magnesium Language Server\",\"version\":\"1.1.1\"}}}", id);
     write_response(resp);
 }
 
